@@ -1,0 +1,98 @@
+# Pilot: five steering methods + a BOW detection baseline.
+#
+# The five, each with its detection twin so the triplet report is meaningful:
+#
+#   method     steering          detection twin      why that twin
+#   prompting  prompt_instruct   p_true              both ask the model verbally
+#   CAD        cad               context_kl          CAD amplifies this shift
+#   AdaCAD     adacad            context_jsd         AdaCAD's adaptive alpha IS this JSD
+#   CK-PLUG    ckplug            confidence_gain     CK-PLUG's gate IS this signal
+#   CAA        caa               diffmean_proj       same mean-difference vector
+#
+# plus, not optional:
+#   bow         the text-only null - if it matches a probe, the probe found a
+#               property of the items, not of the model
+#   margin      the DV itself, the floor everything must beat
+#   logit_lens  the readout control at the probes' layer and position
+#   act_add     orthogonalized CAA, to show what the correction buys over caa
+
+model:
+  name: meta-llama/Llama-3.1-8B-Instruct
+  device: auto
+  dtype: auto
+
+out_dir: runs/pilot_five
+limit: 400
+seed: 0
+n_splits: 5
+steering_n_splits: 2
+
+prompt:
+  style: question
+  background_prefix: "Background: "
+  separator: "\n\n"
+  answer_prefix: ""
+
+conditions: [N, S, C, R]
+reference_condition: R
+detection_condition: C
+detection_conditions: [C]
+detection_positions: [end_of_context, last]
+steering_condition: C
+
+dataset:
+  loader: load_confiqa_cloze_clusters
+  kwargs:
+    use_context_piece: false
+    min_alias_len: 0
+    seed: 0
+
+qc:
+  drop_first_token_collisions: true
+
+detectors:
+  - bow               # the baseline that matters
+  - margin            # the floor
+  - p_true            # prompting
+  - context_kl        # CAD
+  - context_jsd       # AdaCAD
+  - confidence_gain   # CK-PLUG
+  - diffmean_proj     # CAA
+  - logit_lens        # readout control
+  - linear_probe      # the strongest mechanistic detector, for reference
+
+steerers:
+  - prompt_instruct
+  - cad
+  - adacad
+  - ckplug
+  - caa
+  - act_add
+
+targets: [use_parametric, use_context]
+factors: [0.5, 1.0, 2.0, 4.0]
+
+method_cfg:
+  bow: {fields: both, ngram_range: [1, 2], min_df: 2, C: 1.0}
+  margin: {format_correct: true}
+  # keep the layer identical across the probes and the readout control, or
+  # auroc_over_readout is not comparing like with like
+  linear_probe: {layer: 19, C: 1.0}
+  diffmean_proj: {layer: 19}
+  logit_lens: {layer: 19}
+
+  prompt_instruct:
+    factors: [0, 1]            # variant index, not a dose
+  cad: {}
+  adacad:
+    factors: [0.5, 1.0, 2.0]   # s=1 is AdaCAD as published
+  ckplug:
+    factors: [0.0, 0.25, 0.5, 0.75, 1.0]   # factor IS alpha, and alpha is in [0,1]
+  caa:
+    layers: [17, 18, 19]
+    orthogonalize: false       # this is the point of `caa` vs `act_add`
+    scale: residual
+  act_add:
+    layers: [17, 18, 19]
+    orthogonalize: true
+    scale: residual

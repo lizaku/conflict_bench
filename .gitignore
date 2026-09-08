@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Run outputs (activations, margin tables, fitted vectors, summaries)
+runs/
+*.npz
+*.pt
+
+# Editors
+.idea/
+.vscode/
+.ipynb_checkpoints/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Dataset — not redistributed here; see README
+data/

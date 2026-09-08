@@ -1,0 +1,118 @@
+# The model is a knob, not a constant. Either form works:
+#   model: mistralai/Mistral-7B-Instruct-v0.3
+# or the block below. device/dtype "auto" -> cuda+bf16 where available,
+# cpu+fp32 otherwise. Layer indices may be given as depth fractions
+# (0.6 = 60% of the way up) so a swap does not silently move the probe layer.
+model:
+  name: meta-llama/Llama-3.1-8B-Instruct   # the 8B in the local HF cache
+  device: auto
+  dtype: auto
+  # cache_dir: /path/to/hf_cache
+  # revision: main
+  # trust_remote_code: false
+
+out_dir: runs/pilot_001
+limit: 200            # pilot: ~200 items keeps a full sweep under a few GPU-hours
+                      # (sampled evenly across relations, not the first N)
+seed: 0
+n_splits: 5           # GroupKFold-by-relation for detection
+steering_n_splits: 2  # folds for fitting steering vectors (act_add)
+
+# Prompt format — the single source of truth for every method and condition.
+#   N        -> "{question}"
+#   S/C/R    -> "Background: {passage}\n\n{question}"
+prompt:
+  style: question            # "question" | "cloze"
+  background_prefix: "Background: "
+  separator: "\n\n"
+  answer_prefix: ""          # e.g. "\nAnswer:" if you want an explicit slot
+
+# The N/S/C/R design. All four are scored for every item (condition_margins.csv
+# + conditions_summary.csv); `reference_condition` is the format baseline that
+# gets subtracted to produce the corrected margin. Both the raw and the
+# corrected number are reported everywhere - drop R from `conditions` and the
+# run proceeds uncorrected, reporting raw only.
+conditions: [N, S, C, R]
+reference_condition: R
+detection_condition: C   # the condition detectors score (labels are defined here)
+
+# WHERE the mechanistic detectors read. Named, resolved per item against the
+# prompt's block spans (core/positions.py) - a raw integer is a different
+# linguistic location on every item once passages differ in length.
+#   end_of_context      last token of the passage: the conflict has been read,
+#                       no answer formulated yet -> a PREDICTIVE probe
+#   answer_mention_last where the passage states the counterfactual answer
+#   subject_last        last token of the subject in the question
+#   end_of_stem / last  the readout position: the model is about to emit its
+#                       answer, so a probe here largely DECODES it
+# The first entry is the primary cell reported in triplet_report.csv; `last`
+# is kept in the sweep so the readout/upstream gap is measured, not assumed.
+detection_positions: [end_of_context, answer_mention_last, last]
+
+# Optionally score detectors under conditions other than the one that produced
+# the labels. Labels are behavioural under C, so [N, S, C] asks whether the
+# pre-conflict state already predicts how the item will be arbitrated.
+detection_conditions: [C]
+steering_condition: C    # the condition steerers intervene on
+
+dataset:
+  loader: load_confiqa_cloze_clusters
+  kwargs:
+    # defaults to conflict_bench/data/ConfiQA_cloze_clustered
+    # data_dir: data/ConfiQA_cloze_clustered
+    # relations: [P17, P27, P36]     # subset by relation file stem
+    use_context_piece: false         # true = single carrier sentence, not the paragraph
+    min_alias_len: 0                 # >0 drops short cf answers (ConFiQA artifact)
+    seed: 0                          # controls which passage becomes each item's R
+
+qc:
+  # first-token collisions are tokenizer-dependent, so they are recomputed per
+  # model rather than read from a static id list. CAD scores a first-token
+  # margin, so leaving them in gives that method a structurally zero DV.
+  drop_first_token_collisions: true
+
+# Detection axis (cheap -> expensive)
+detectors:
+  - margin            # floor: the v3 DV itself, R-corrected
+  - confidence_gain   # CK-PLUG signal, grey-box
+  - p_true            # verbalized / prompting leg of the triplet
+  - diffmean_proj     # mechanistic, cheap
+  - linear_probe      # mechanistic, GroupKFold enforced by runner
+  - logit_lens        # MANDATORY readout control: the model's own unembedding
+                      # read at the same layer/position as the probes
+  - semantic_entropy  # 10 samples/item — run on the pilot subset first
+  # - selfcheck_nli   # phase 2
+
+# Steering axis
+steerers:
+  - prompt_instruct   # mandatory baseline
+  - cad               # output-based, training-free
+  - act_add           # mechanistic — vectors fitted from scratch during the run
+  # - ckplug          # phase 2: clone byronBBL/CK-PLUG
+  # - csks            # phase 3: needs trained proxy models
+
+targets: [use_parametric, use_context]
+factors: [0.5, 1.0, 2.0, 4.0, 8.0]   # act_add alpha; cad alpha; prompt = variant idx
+
+method_cfg:
+  margin: {format_correct: true}
+  # layer must match across the probes and logit_lens, or the readout control
+  # is not comparing like with like. Omit `position` so the sweep applies.
+  linear_probe: {layer: 19, C: 1.0}
+  diffmean_proj: {layer: 19}
+  logit_lens: {layer: 19}
+  act_add:
+    layers: [17, 18, 19]
+    position: -1
+    orthogonalize: true    # remove the "a passage exists" component (v_use)
+    scale: residual        # alpha=1 == one typical residual norm at that layer
+    format_correct: true
+    measure_fluency: true
+    seed: 0
+    vectors_path: null     # set to a saved artifacts/act_add/*vectors.pt to skip fit()
+  prompt_instruct:
+    format_correct: true
+    measure_fluency: true
+    factors: [0, 1]        # variant index, not a dose - overrides the global sweep
+  cad: {}
+  semantic_entropy: {num_samples: 10, temperature: 1.0}
