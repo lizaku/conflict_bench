@@ -34,16 +34,3 @@ pip install torch transformers scikit-learn pandas numpy pyyaml
 python -m conflict_bench.run --config conflict_bench/configs/default.yaml
 python -m conflict_bench.experiments.run_pilot --limit 200
 ```
-
-The model is a config knob (`model:` — an HF id or a block with
-`name` / `device` / `dtype`); layer indices accept depth fractions so a config
-survives a model swap. Runs are checkpointed and resumable, and every fitted
-object — probe coefficients, steering vectors, cached activations — is written
-next to the summary that quotes it.
-
-## Status
-
-Research code under active development. The methods run end to end, but the
-numbers they produce have not been validated against published baselines, and
-the measurement layer has known issues that are being worked through — see
-`IDEAS.md` if you have it.
