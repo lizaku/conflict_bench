@@ -14,32 +14,72 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import GroupKFold
 
 
+_EMPTY_AUROC = {"auroc": float("nan"), "auroc_std": float("nan"),
+                "base_rate_auroc": float("nan"), "accuracy": float("nan"),
+                "accuracy_std": float("nan"),
+                "majority_accuracy": float("nan"), "n_folds": 0}
+
+
+def _best_threshold(scores, labels):
+    """(threshold, accuracy) maximising accuracy of `scores > t` on THIS data.
+
+    Only ever called on a training fold - see grouped_auroc.  A detector's
+    score convention is HIGHER = more context-following, so the rule is
+    always `> t`; a detector that needed the opposite sign would have been
+    negated at the source (see the score convention in CLAUDE.md).
+    """
+    order = np.argsort(scores, kind="mergesort")
+    s, y = np.asarray(scores)[order], np.asarray(labels)[order]
+    n, pos = len(y), int(y.sum())
+    # split i: predict 0 on s[:i], 1 on s[i:]
+    correct_neg = np.concatenate([[0], np.cumsum(1 - y)])
+    correct_pos = np.concatenate([[pos], pos - np.cumsum(y)])
+    acc = (correct_neg + correct_pos) / n
+    i = int(np.argmax(acc))
+    if i == 0:
+        thr = float(s[0]) - 1e-9
+    elif i == n:
+        thr = float(s[-1]) + 1e-9
+    else:
+        thr = float(0.5 * (s[i - 1] + s[i]))
+    return thr, float(acc[i])
+
+
 def grouped_auroc(scores, labels, groups, n_splits=5):
     """AUROC on held-out relation groups + base-rate control AUROC."""
     scores, labels, groups = map(np.asarray, (scores, labels, groups))
     n_splits = min(n_splits, len(np.unique(groups)))
     if n_splits < 2 or len(np.unique(labels)) < 2:
-        return {"auroc": float("nan"), "auroc_std": float("nan"),
-                "base_rate_auroc": float("nan"), "n_folds": 0,
-                "note": "not enough relations or a single label class"}
+        return dict(_EMPTY_AUROC,
+                    note="not enough relations or a single label class")
     gkf = GroupKFold(n_splits=n_splits)
-    aucs, base_aucs = [], []
+    aucs, base_aucs, accs, maj_accs = [], [], [], []
     for tr, te in gkf.split(scores, labels, groups):
         if len(np.unique(labels[te])) < 2:
             continue
         aucs.append(roc_auc_score(labels[te], scores[te]))
+        # accuracy: threshold chosen on the TRAIN fold, applied to the test
+        # fold - never the test-optimal threshold, which is a leak
+        thr, _ = _best_threshold(scores[tr], labels[tr])
+        accs.append(float(np.mean((scores[te] > thr).astype(int) == labels[te])))
+        # the majority-class predictor from the same train fold: accuracy is
+        # meaningless without it once the classes are imbalanced
+        maj = int(np.mean(labels[tr]) >= 0.5)
+        maj_accs.append(float(np.mean(labels[te] == maj)))
         # base-rate predictor: score every item by its relation's TRAIN rate
         tr_rate = pd.Series(labels[tr]).groupby(pd.Series(groups[tr])).mean()
         base = np.array([tr_rate.get(g, tr_rate.mean()) for g in groups[te]])
         base_aucs.append(roc_auc_score(labels[te], base))
     if not aucs:
-        return {"auroc": float("nan"), "auroc_std": float("nan"),
-                "base_rate_auroc": float("nan"), "n_folds": 0,
-                "note": "every fold was single-class"}
+        return dict(_EMPTY_AUROC, note="every fold was single-class")
     return {"auroc": float(np.mean(aucs)),
             "auroc_std": float(np.std(aucs)),
             "base_rate_auroc": float(np.mean(base_aucs)),
             "auroc_margin_over_base": float(np.mean(aucs) - np.mean(base_aucs)),
+            "accuracy": float(np.mean(accs)),
+            "accuracy_std": float(np.std(accs)),
+            "majority_accuracy": float(np.mean(maj_accs)),
+            "accuracy_over_majority": float(np.mean(accs) - np.mean(maj_accs)),
             "n_folds": len(aucs)}
 
 
@@ -140,3 +180,78 @@ def triplet_report(detection_results: dict, steering_df: pd.DataFrame,
             "prompting_baseline_flip": best_prompt,
         })
     return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------- simple view
+#: the columns of simple_report, in order. Detection rows fill the detection
+#: block and blank the steering one, and vice versa - one row per method, one
+#: metric family per axis, so methods are read down a single column.
+SIMPLE_COLUMNS = ["method", "axis", "auroc", "auroc_base", "accuracy",
+                  "acc_majority", "flip_rate", "flip_flippable",
+                  "specific_effect", "factor", "target", "n", "note"]
+
+
+def simple_report(detection_results, steering_df=None, notes=None):
+    """One flat table: AUROC/accuracy for every detector, flip rate for every
+    steerer.  The first-look view - `triplet_report` remains the full one.
+
+    Uniformity is the point: every detector is scored by the same two numbers
+    on the same held-out items, and every steerer by the same flip rate at its
+    own best factor, so a column can be read straight down.
+
+    The controls are rows, not omissions.  `auroc_base` (the relation base
+    rate) sits beside every AUROC and `acc_majority` beside every accuracy;
+    `bow`, `margin` and `logit_lens` appear as their own rows because a
+    detector that does not beat them has not been shown to work.
+    """
+    notes = notes or {}
+    rows = []
+
+    # detection: keep the primary (position, condition) cell per method, so
+    # the table does not multiply out into every probe site
+    primary = {}
+    for key, d in (detection_results or {}).items():
+        base = d.get("method", key)
+        if d.get("primary", True) or base not in primary:
+            primary[base] = d
+    for m, d in primary.items():
+        rows.append({"method": m, "axis": "detection",
+                     "auroc": d.get("auroc", np.nan),
+                     "auroc_base": d.get("base_rate_auroc", np.nan),
+                     "accuracy": d.get("accuracy", np.nan),
+                     "acc_majority": d.get("majority_accuracy", np.nan),
+                     "n": d.get("n_items"),
+                     "note": notes.get(m, "")})
+
+    # steering: each method at the factor/target where it moved the most items
+    if steering_df is not None and len(steering_df):
+        rank = ("flip_rate_flippable" if "flip_rate_flippable" in steering_df
+                else "flip_rate")
+        for m, s in steering_df.groupby("method"):
+            s = s[s[rank].notna()]
+            if not len(s):
+                continue
+            best = s.loc[s[rank].idxmax()]
+            rows.append({"method": m, "axis": "steering",
+                         "flip_rate": best.get("flip_rate", np.nan),
+                         "flip_flippable": best.get("flip_rate_flippable",
+                                                    np.nan),
+                         "specific_effect": best.get("specific_effect", np.nan),
+                         "factor": best.get("factor"),
+                         "target": best.get("target"),
+                         "n": best.get("n"),
+                         "note": notes.get(m, "")})
+
+    df = pd.DataFrame(rows, columns=SIMPLE_COLUMNS)
+    if df.empty:
+        return df
+    order = {"detection": 0, "steering": 1}
+    df["_axis"] = df.axis.map(order)
+    df["_rank"] = np.where(df.axis == "detection",
+                           df.auroc.fillna(-1), df.flip_flippable.fillna(-1))
+    df = (df.sort_values(["_axis", "_rank"], ascending=[True, False])
+            .drop(columns=["_axis", "_rank"]).reset_index(drop=True))
+    num = [c for c in SIMPLE_COLUMNS
+           if c not in ("method", "axis", "target", "n", "note")]
+    df[num] = df[num].astype(float).round(3)
+    return df

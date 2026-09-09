@@ -54,6 +54,16 @@ METHOD_PAIRS = [
     ("logit lens (readout control)", "logit_lens", None),
 ]
 
+#: what a row in the simple report is there to tell you. The three controls
+#: are rows in that table rather than columns, so they are read the same way
+#: as the methods they bound.
+SIMPLE_NOTES = {
+    "bow": "control: text-only null",
+    "margin": "floor: the DV itself",
+    "logit_lens": "control: readout at the probes' layer/position",
+    "prompt_instruct": "baseline: prompting",
+}
+
 STAGES = ("data", "conditions", "detection", "steering", "report")
 
 
@@ -153,6 +163,41 @@ def stage_steering(cfg, model, items, labels, groups, out, artifacts, force):
 
 
 # --------------------------------------------------------------------- report
+def build_simple_report(det_summ, steer_df, out, manifest):
+    """The first-look table: one row per method, one metric family per axis.
+
+    Written on every run - it is post-processing over tables that already
+    exist, so it costs nothing and never replaces `pilot_report` /
+    `triplet_report`, which carry the full controls.
+    """
+    simple = metrics.simple_report(det_summ, steer_df, notes=SIMPLE_NOTES)
+    simple.to_csv(out / "simple_report.csv", index=False)
+    lines = ["# Simple report", "",
+             f"- model: `{manifest['model']['model']}`",
+             f"- items: {manifest['n_items']} over "
+             f"{len(manifest['relations'])} relations",
+             f"- context-following rate: "
+             f"{manifest['context_following_rate']:.3f}", "",
+             _as_table(simple), "",
+             "## Reading it", "",
+             "- **detection** - `auroc` is over relations held out by "
+             "GroupKFold; `accuracy` uses a threshold fitted on the train "
+             "folds only.",
+             "- a detector is only doing something if it beats all three of "
+             "`auroc_base` (its own row), the `bow` row, and the `logit_lens` "
+             "row.",
+             "- **steering** - `flip_rate` is the share of items whose margin "
+             "changed sign; `flip_flippable` conditions on the items that "
+             "could move, and is the number to compare across methods.",
+             "- `factor` is where each method peaked, so the doses are not "
+             "comparable between rows - `flip_flippable` is.",
+             "- `specific_effect` is delta-margin minus the matched control; "
+             "a flip rate with a near-zero specific effect is the control "
+             "moving, not the method.", ""]
+    (out / "simple_report.md").write_text("\n".join(lines), encoding="utf-8")
+    return simple
+
+
 def build_report(det_summ, steer_df, cfg, out, manifest):
     """The pilot's headline table: one row per method, both axes."""
     rows = []
@@ -240,6 +285,14 @@ def main(argv=None):
     ap.add_argument("--stages", nargs="*", default=list(STAGES), choices=STAGES)
     ap.add_argument("--force", action="store_true",
                     help="re-run the requested stages even if outputs exist")
+    ap.add_argument("--factors", nargs="*", type=float, default=None,
+                    help="override the global steering dose sweep, e.g. "
+                         "--factors 1.0; methods that declare their own "
+                         "factors (prompt_instruct, ckplug, adacad) keep them")
+    ap.add_argument("--simple", action="store_true",
+                    help="first-look run: one probe position, one detection "
+                         "condition, and the flat simple_report table printed "
+                         "at the end (the full tables are still written)")
     args = ap.parse_args(argv)
 
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
@@ -256,6 +309,22 @@ def main(argv=None):
         cfg["dataset"].setdefault("kwargs", {})["relations"] = args.relations
     if args.out:
         cfg["out_dir"] = args.out
+    if args.factors:
+        # the GLOBAL dose sweep only. A method that declares its own `factors`
+        # in method_cfg keeps it, deliberately: prompt_instruct's factor is a
+        # variant index whose 0 is its own control, and ckplug's factor IS
+        # alpha and is only defined on [0, 1] - overriding either from a
+        # dose-shaped flag would change what the method means, not its cost.
+        cfg["factors"] = list(args.factors)
+    if args.simple:
+        # cheapest run that still answers "which method is better": the
+        # primary probe position only, and only the condition the labels are
+        # defined under. This trims the sweep, NOT the confound controls -
+        # bow, logit_lens, the base rate and the matched steering control all
+        # still run, and pilot_report / triplet_report are still written.
+        cfg["detection_positions"] = (cfg.get("detection_positions")
+                                      or ["end_of_context"])[:1]
+        cfg["detection_conditions"] = [cfg.get("detection_condition", "C")]
 
     out = Path(cfg["out_dir"])
     out.mkdir(parents=True, exist_ok=True)
@@ -302,10 +371,12 @@ def main(argv=None):
         metrics.triplet_report(det_summ, steer_df if len(steer_df) else None
                                ).to_csv(out / "triplet_report.csv", index=False)
         report = build_report(det_summ, steer_df, cfg, out, manifest)
+        simple = build_simple_report(det_summ, steer_df, out, manifest)
         print()
-        print(report.to_string(index=False))
+        print((simple if args.simple else report).to_string(index=False))
         print()
-        log("report", f"wrote pilot_report.csv / pilot_report.md to {out}")
+        log("report", f"wrote simple_report.csv / pilot_report.csv / "
+                      f"triplet_report.csv to {out}")
 
     model.acts.flush()
     model.margins.flush()
