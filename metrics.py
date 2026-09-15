@@ -186,25 +186,27 @@ def triplet_report(detection_results: dict, steering_df: pd.DataFrame,
 #: the columns of simple_report, in order. Detection rows fill the detection
 #: block and blank the steering one, and vice versa - one row per method, one
 #: metric family per axis, so methods are read down a single column.
-SIMPLE_COLUMNS = ["method", "axis", "auroc", "auroc_base", "accuracy",
-                  "acc_majority", "flip_rate", "flip_flippable",
-                  "specific_effect", "factor", "target", "n", "note"]
+SIMPLE_COLUMNS = ["method", "axis", "auroc", "auroc_raw", "auroc_base",
+                  "auroc_over_readout", "accuracy", "acc_majority",
+                  "flip_rate", "flip_rate_raw", "flip_flippable",
+                  "specific_effect", "factor", "target", "n"]
 
 
-def simple_report(detection_results, steering_df=None, notes=None):
+def simple_report(detection_results, steering_df=None):
     """One flat table: AUROC/accuracy for every detector, flip rate for every
-    steerer.  The first-look view - `triplet_report` remains the full one.
+    steerer.  The pilot's final table.
 
-    Uniformity is the point: every detector is scored by the same two numbers
-    on the same held-out items, and every steerer by the same flip rate at its
+    Uniformity is the point: every detector is scored by the same numbers on
+    the same held-out items, and every steerer by the same flip rate at its
     own best factor, so a column can be read straight down.
 
-    The controls are rows, not omissions.  `auroc_base` (the relation base
-    rate) sits beside every AUROC and `acc_majority` beside every accuracy;
-    `bow`, `margin` and `logit_lens` appear as their own rows because a
-    detector that does not beat them has not been shown to work.
+    The controls are columns or rows, not omissions: `auroc_base` (relation
+    base rate), `auroc_over_readout` (vs logit_lens at the same site) and
+    `acc_majority` sit beside every detector; `auroc_raw` / `flip_rate_raw`
+    beside the R-corrected numbers; `bow`, `margin` and `logit_lens` are
+    their own rows.  A detector that does not beat them has not been shown
+    to work.
     """
-    notes = notes or {}
     rows = []
 
     # detection: keep the primary (position, condition) cell per method, so
@@ -217,11 +219,12 @@ def simple_report(detection_results, steering_df=None, notes=None):
     for m, d in primary.items():
         rows.append({"method": m, "axis": "detection",
                      "auroc": d.get("auroc", np.nan),
+                     "auroc_raw": d.get("auroc_raw", np.nan),
                      "auroc_base": d.get("base_rate_auroc", np.nan),
+                     "auroc_over_readout": d.get("auroc_over_readout", np.nan),
                      "accuracy": d.get("accuracy", np.nan),
                      "acc_majority": d.get("majority_accuracy", np.nan),
-                     "n": d.get("n_items"),
-                     "note": notes.get(m, "")})
+                     "n": d.get("n_items")})
 
     # steering: each method at the factor/target where it moved the most items
     if steering_df is not None and len(steering_df):
@@ -234,13 +237,13 @@ def simple_report(detection_results, steering_df=None, notes=None):
             best = s.loc[s[rank].idxmax()]
             rows.append({"method": m, "axis": "steering",
                          "flip_rate": best.get("flip_rate", np.nan),
+                         "flip_rate_raw": best.get("flip_rate_raw", np.nan),
                          "flip_flippable": best.get("flip_rate_flippable",
                                                     np.nan),
                          "specific_effect": best.get("specific_effect", np.nan),
                          "factor": best.get("factor"),
                          "target": best.get("target"),
-                         "n": best.get("n"),
-                         "note": notes.get(m, "")})
+                         "n": best.get("n")})
 
     df = pd.DataFrame(rows, columns=SIMPLE_COLUMNS)
     if df.empty:
@@ -252,6 +255,6 @@ def simple_report(detection_results, steering_df=None, notes=None):
     df = (df.sort_values(["_axis", "_rank"], ascending=[True, False])
             .drop(columns=["_axis", "_rank"]).reset_index(drop=True))
     num = [c for c in SIMPLE_COLUMNS
-           if c not in ("method", "axis", "target", "n", "note")]
+           if c not in ("method", "axis", "target", "n")]
     df[num] = df[num].astype(float).round(3)
     return df
