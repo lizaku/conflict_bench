@@ -4,9 +4,16 @@ Non-negotiables (from the v3 postmortems):
   1. Detection AUROC is ALWAYS GroupKFold-by-relation, and ALWAYS reported
      next to the relation-base-rate-only AUROC (0.822 vs 0.936 lesson).
   2. Steering effects are ALWAYS reported vs the method's matched control
-     (norm-matched random direction for act_add; alpha=0 for decoding).
+     (norm-matched random direction for act_add, a placebo instruction for
+     prompt_instruct, the unsteered distribution for the decoding family).
+     A method with no control gets NaN, never a silent zero.
   3. Every method table carries the triplet:
      detection AUROC | causal effect vs control | prompting-baseline effect.
+  4. Every flip rate is reported with the `n_flippable` it was computed over.
+     A rate over 6 items and a rate over 394 are not the same measurement,
+     and collapsing a method to its best cell by argmax across targets is how
+     4-of-6 came to outrank 390-of-394 in the pilot table.  Both targets are
+     reported, always, as their own rows.
 """
 import numpy as np
 import pandas as pd
@@ -84,25 +91,45 @@ def grouped_auroc(scores, labels, groups, n_splits=5):
 
 
 def steering_summary(records):
-    """Per (method, target, factor): flip rate, delta-margin, vs control.
+    """Per (method, target, factor, condition): flip rates, delta-margin,
+    effect vs the matched control, and the S-vs-C specificity pairing.
 
-    `flip_rate` is over all items; `flip_rate_flippable` is over the items
-    that could move (those not already on the target side of zero) - both are
-    reported because the first is deflated by whatever the base rate happens
-    to be for that relation mix.
+    Every rate carries the count it was computed over.  `flip_rate` is over
+    all items; `flip_rate_flippable` is over the items that could move (those
+    not already on the target side of zero) and `n_flippable` says how many
+    that was.  Reading a flippable rate without its n is how the pilot table
+    ranked 4-of-6 items above 390-of-394.
 
-    `flip_rate_raw` is the same verdict on the uncorrected margin.  The R
+    Three views of the flip verdict are kept: `flip_rate` on whichever margin
+    the run made primary, `flip_rate_raw` on the observed margin, and
+    `flip_rate_corrected` on the R-corrected one when R was scored.  The R
     offset is a per-item constant, so it cancels out of delta-margin entirely
-    - `d_margin` is identical either way, and there is deliberately no
+    - `d_margin` is identical either way and there is deliberately no
     `d_margin_raw` column pretending otherwise.  What the correction changes
-    is which side of zero an item starts and ends on, i.e. the flip rate.  A
-    large gap between `flip_rate` and `flip_rate_raw` means the flips are
-    being manufactured (or hidden) by the passage template rather than by the
-    intervention.
+    is which side of zero an item starts and ends on.  A large gap between
+    `flip_rate_raw` and `flip_rate_corrected` means the flips are being
+    manufactured (or hidden) by the reference passage rather than by the
+    intervention - which is exactly what the pilot postmortem found.
+
+    `specific_effect` is delta-margin minus the method's matched control, and
+    it is NaN when the method declared no control rather than being silently
+    equated with the raw delta.
+
+    `effect_toward_target` re-signs it so that HIGHER is always better for
+    whichever target the row is about, which is what makes a use_context row
+    and a use_parametric row comparable in one column.
+
+    `conflict_specific_effect` is the S-vs-C pairing: the effect under the
+    conflicting passage minus the effect under the supporting one, for the
+    same method, target and dose. It answers the benchmark's steering
+    question - can the intervention move the model when there IS a conflict,
+    over and above what it does when there is not - and it is NaN unless the
+    run scored both conditions.
     """
     df = pd.DataFrame([r.__dict__ for r in records])
     if df.empty:
         return df
+    df["condition"] = [getattr(c, "value", c) for c in df.condition]
     df["d_margin"] = df.margin_after - df.margin_before
     df["d_margin_ctrl"] = np.where(
         df.control_margin_after.notna(),
@@ -110,12 +137,15 @@ def steering_summary(records):
     df["flippable"] = [bool((e or {}).get("flippable", True))
                        for e in df.get("extras", [{}] * len(df))]
     df["flip_flippable"] = np.where(df.flippable, df.flipped, np.nan)
-    if "flipped_raw" not in df:
-        df["flipped_raw"] = np.nan
-    df["flipped_raw"] = df.flipped_raw.astype(float)
-    out = (df.groupby(["method", "target", "factor"])
+    for col in ("flipped_raw", "flipped_corrected"):
+        if col not in df:
+            df[col] = np.nan
+        df[col] = df[col].astype(float)
+
+    out = (df.groupby(["method", "target", "factor", "condition"])
              .agg(flip_rate=("flipped", "mean"),
                   flip_rate_raw=("flipped_raw", "mean"),
+                  flip_rate_corrected=("flipped_corrected", "mean"),
                   flip_rate_flippable=("flip_flippable", "mean"),
                   n_flippable=("flippable", "sum"),
                   d_margin=("d_margin", "mean"),
@@ -126,7 +156,37 @@ def steering_summary(records):
                   fluency=("fluency", "mean"),
                   n=("item_id", "count"))
              .reset_index())
-    out["specific_effect"] = out.d_margin - out.d_margin_control.fillna(0)
+    # NaN, not zero: a missing control is an unmeasured control
+    out["specific_effect"] = out.d_margin - out.d_margin_control
+    out["has_control"] = out.d_margin_control.notna()
+    sign = np.where(out.target == "use_context", -1.0, 1.0)
+    out["effect_toward_target"] = out.specific_effect * sign
+    out["d_margin_toward_target"] = out.d_margin * sign
+    out["flippable_share"] = out.n_flippable / out.n.replace(0, np.nan)
+    return _pair_conditions(out)
+
+
+def _pair_conditions(out, conflict="C", support="S"):
+    """Attach the S-vs-C specificity pairing to every conflict-condition row.
+
+    The supporting passage is the matched control the benchmark's question
+    asks for - same item, same intervention, same dose, nothing to arbitrate.
+    A method whose effect survives the subtraction is resolving a conflict; a
+    method whose effect vanishes is just amplifying whatever the passage said.
+    """
+    if "condition" not in out or support not in set(out.condition):
+        out["support_d_margin"] = np.nan
+        out["conflict_specific_effect"] = np.nan
+        return out
+    keys = ["method", "target", "factor"]
+    sup = (out[out.condition == support][keys + ["d_margin", "specific_effect"]]
+           .rename(columns={"d_margin": "support_d_margin",
+                            "specific_effect": "support_specific_effect"}))
+    out = out.merge(sup, on=keys, how="left")
+    is_conf = out.condition == conflict
+    sign = np.where(out.target == "use_context", -1.0, 1.0)
+    out["conflict_specific_effect"] = np.where(
+        is_conf, (out.d_margin - out.support_d_margin) * sign, np.nan)
     return out
 
 
@@ -150,6 +210,10 @@ def triplet_report(detection_results: dict, steering_df: pd.DataFrame,
     methods = list(detection_results)
     if steering_df is not None and len(steering_df):
         methods += [m for m in steering_df.method.unique() if m not in methods]
+        # the prompting baseline is read on the conflict condition only - the
+        # S arm is a control, not a result
+        if "condition" in steering_df:
+            steering_df = steering_df[steering_df.condition == "C"]
         prompt_effect = steering_df[steering_df.method == prompt_method]
         best_prompt = (prompt_effect.groupby("target").flip_rate.max().mean()
                        if len(prompt_effect) else np.nan)
@@ -184,28 +248,54 @@ def triplet_report(detection_results: dict, steering_df: pd.DataFrame,
 
 # --------------------------------------------------------------- simple view
 #: the columns of simple_report, in order. Detection rows fill the detection
-#: block and blank the steering one, and vice versa - one row per method, one
-#: metric family per axis, so methods are read down a single column.
-SIMPLE_COLUMNS = ["method", "axis", "auroc", "auroc_raw", "auroc_base",
-                  "auroc_over_readout", "accuracy", "acc_majority",
-                  "flip_rate", "flip_rate_raw", "flip_flippable",
-                  "specific_effect", "factor", "target", "n"]
+#: block and blank the steering one, and vice versa - one metric family per
+#: axis, so methods are read down a single column.
+SIMPLE_COLUMNS = ["method", "axis", "target",
+                  # detection block
+                  "auroc", "auroc_base", "auroc_over_readout",
+                  "auroc_raw", "auroc_corrected", "accuracy", "acc_majority",
+                  # steering block
+                  "effect", "conflict_specific", "flip_rate",
+                  "flip_flippable", "n_flippable", "flip_rate_raw",
+                  "flip_rate_corrected", "has_control", "factor",
+                  # shared
+                  "n", "note"]
+
+#: rows that are controls rather than results, and what they control for
+CONTROL_NOTES = {
+    "bow": "control: text-only null (near-oracle under the conflict task)",
+    "logit_lens": "control: readout at the probes' layer/position",
+    "margin": "floor: the DV itself",
+    "prompt_instruct": "baseline: prompting",
+}
 
 
-def simple_report(detection_results, steering_df=None):
-    """One flat table: AUROC/accuracy for every detector, flip rate for every
-    steerer.  The pilot's final table.
+def simple_report(detection_results, steering_df=None, conflict_condition="C"):
+    """One flat table: the detection axis by AUROC, the steering axis by
+    effect and flip rate - with BOTH targets, always, as their own rows.
 
-    Uniformity is the point: every detector is scored by the same numbers on
-    the same held-out items, and every steerer by the same flip rate at its
-    own best factor, so a column can be read straight down.
+    Three things this table refuses to do, each of them a lesson from the
+    pilot postmortem:
 
-    The controls are columns or rows, not omissions: `auroc_base` (relation
-    base rate), `auroc_over_readout` (vs logit_lens at the same site) and
-    `acc_majority` sit beside every detector; `auroc_raw` / `flip_rate_raw`
-    beside the R-corrected numbers; `bow`, `margin` and `logit_lens` are
-    their own rows.  A detector that does not beat them has not been shown
-    to work.
+      - It does not collapse a steerer to its best cell across targets.  That
+        argmax is how `use_context` at 4-of-6-flippable-items came to outrank
+        `use_parametric` at 390-of-394, and how a method whose context arm was
+        a no-op by construction still got a plausible-looking row.  Every
+        (method, target) pair is a row; the dose is still chosen per row,
+        because doses are not comparable across methods, but the target never
+        is.
+      - It does not print a flip rate without `n_flippable`.  A rate over 6
+        items and a rate over 394 are different measurements.
+      - It does not fill a missing control with zero.  `has_control` says
+        whether `effect` is controlled; where it is False the number is a
+        bare delta-margin and must not be read against a controlled one.
+
+    `effect` is `effect_toward_target`: the controlled delta-margin re-signed
+    so HIGHER is better for whichever target the row is about.  That is what
+    makes a use_context row and a use_parametric row comparable.
+    `conflict_specific` is the same quantity minus what the method did to the
+    SAME items under a supporting passage - the benchmark's actual steering
+    question.
     """
     rows = []
 
@@ -219,31 +309,48 @@ def simple_report(detection_results, steering_df=None):
     for m, d in primary.items():
         rows.append({"method": m, "axis": "detection",
                      "auroc": d.get("auroc", np.nan),
-                     "auroc_raw": d.get("auroc_raw", np.nan),
                      "auroc_base": d.get("base_rate_auroc", np.nan),
                      "auroc_over_readout": d.get("auroc_over_readout", np.nan),
+                     "auroc_raw": d.get("auroc_raw", np.nan),
+                     "auroc_corrected": d.get("auroc_corrected", np.nan),
                      "accuracy": d.get("accuracy", np.nan),
                      "acc_majority": d.get("majority_accuracy", np.nan),
-                     "n": d.get("n_items")})
+                     "n": d.get("n_instances", d.get("n_items")),
+                     "note": CONTROL_NOTES.get(m, "")})
 
-    # steering: each method at the factor/target where it moved the most items
+    # steering: one row per (method, target), at that arm's best dose on the
+    # conflict condition
     if steering_df is not None and len(steering_df):
-        rank = ("flip_rate_flippable" if "flip_rate_flippable" in steering_df
-                else "flip_rate")
-        for m, s in steering_df.groupby("method"):
-            s = s[s[rank].notna()]
-            if not len(s):
+        sdf = steering_df
+        if "condition" in sdf:
+            conf = sdf[sdf.condition == conflict_condition]
+            sdf = conf if len(conf) else sdf
+        rank = sdf.get("effect_toward_target")
+        if rank is None:
+            rank = sdf.get("d_margin_toward_target", pd.Series(np.nan,
+                                                               index=sdf.index))
+        sdf = sdf.assign(_rank=rank.fillna(
+            sdf.get("d_margin_toward_target", pd.Series(np.nan,
+                                                        index=sdf.index))))
+        for (m, t), g in sdf.groupby(["method", "target"]):
+            g = g[g._rank.notna()]
+            if not len(g):
                 continue
-            best = s.loc[s[rank].idxmax()]
-            rows.append({"method": m, "axis": "steering",
-                         "flip_rate": best.get("flip_rate", np.nan),
-                         "flip_rate_raw": best.get("flip_rate_raw", np.nan),
-                         "flip_flippable": best.get("flip_rate_flippable",
-                                                    np.nan),
-                         "specific_effect": best.get("specific_effect", np.nan),
-                         "factor": best.get("factor"),
-                         "target": best.get("target"),
-                         "n": best.get("n")})
+            best = g.loc[g._rank.idxmax()]
+            rows.append({
+                "method": m, "axis": "steering", "target": t,
+                "effect": best.get("effect_toward_target", np.nan),
+                "conflict_specific": best.get("conflict_specific_effect",
+                                              np.nan),
+                "flip_rate": best.get("flip_rate", np.nan),
+                "flip_flippable": best.get("flip_rate_flippable", np.nan),
+                "n_flippable": best.get("n_flippable", np.nan),
+                "flip_rate_raw": best.get("flip_rate_raw", np.nan),
+                "flip_rate_corrected": best.get("flip_rate_corrected", np.nan),
+                "has_control": bool(best.get("has_control", False)),
+                "factor": best.get("factor"),
+                "n": best.get("n"),
+                "note": CONTROL_NOTES.get(m, "")})
 
     df = pd.DataFrame(rows, columns=SIMPLE_COLUMNS)
     if df.empty:
@@ -251,10 +358,12 @@ def simple_report(detection_results, steering_df=None):
     order = {"detection": 0, "steering": 1}
     df["_axis"] = df.axis.map(order)
     df["_rank"] = np.where(df.axis == "detection",
-                           df.auroc.fillna(-1), df.flip_flippable.fillna(-1))
-    df = (df.sort_values(["_axis", "_rank"], ascending=[True, False])
+                           df.auroc.fillna(-1), df.effect.fillna(-1e9))
+    df = (df.sort_values(["_axis", "target", "_rank"],
+                         ascending=[True, True, False], na_position="first")
             .drop(columns=["_axis", "_rank"]).reset_index(drop=True))
     num = [c for c in SIMPLE_COLUMNS
-           if c not in ("method", "axis", "target", "n")]
+           if c not in ("method", "axis", "target", "n", "n_flippable",
+                        "has_control", "note")]
     df[num] = df[num].astype(float).round(3)
     return df

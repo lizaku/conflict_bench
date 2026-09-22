@@ -16,9 +16,10 @@ the tokenizer's offset mapping:
     end_of_context      last token of the passage, BEFORE the question is
                         re-stated - the earliest point at which the conflict
                         has been read but no answer has been formulated
-    answer_mention_last last token of the counterfactual answer where the
-                        passage states it - where the conflicting claim
-                        actually enters the residual stream
+    answer_mention_last last token of the answer the PASSAGE asserts - the
+                        counterfactual under C, the true answer under S - so
+                        the position means the same thing on both sides of
+                        the S-vs-C contrast and stays resolvable for both
     subject_last        last token of the subject mention in the question
     end_of_stem         last token of the question (before answer_prefix)
     last                the final prompt token - the readout position, kept
@@ -42,6 +43,22 @@ READOUT_POSITIONS = ("last", "end_of_stem")
 
 class PositionError(ValueError):
     """A named position that does not exist for this (item, condition)."""
+
+
+def asserted_answers(item, condition) -> list:
+    """The answer strings the passage under `condition` actually states.
+
+    C asserts the counterfactual, S asserts the true answer, and N/R assert
+    neither.  Anything that needs "the claim the passage makes" - the probe
+    position, a detector that reads where the claim lands - has to ask this
+    rather than assume the counterfactual, or it silently only works under C.
+    """
+    c = getattr(condition, "value", condition)
+    if c == "C":
+        return [item.counterfactual_answer] + list(item.cf_aliases)
+    if c == "S":
+        return [item.true_answer] + list(item.true_aliases)
+    return []
 
 
 def _last_token_in(offsets, start, end):
@@ -114,16 +131,26 @@ def resolve(model, item, condition, position, prompt=None, spec=None):
         if "background" not in spans:
             raise PositionError(
                 "'answer_mention_last' needs a passage to find the answer in")
+        # WHICH answer depends on the condition: the S passage asserts the
+        # true answer, the C passage the counterfactual. Hard-coding the
+        # counterfactual made this position unresolvable under S, which would
+        # drop every item from the S-vs-C detection axis.
+        cands = asserted_answers(item, condition)
+        if not cands:
+            raise PositionError(
+                f"condition {getattr(condition, 'value', condition)} asserts "
+                f"neither answer, so 'answer_mention_last' does not exist "
+                f"for it")
         target = None
-        for cand in [item.counterfactual_answer] + list(item.cf_aliases):
+        for cand in cands:
             target = _find_span(text, cand, spans["background"])
             if target:
                 break
         if not target:
             raise PositionError(
-                f"item {item.item_id}: counterfactual answer "
-                f"'{item.counterfactual_answer}' does not occur verbatim in "
-                f"its passage")
+                f"item {item.item_id}: the answer asserted under "
+                f"{getattr(condition, 'value', condition)} ('{cands[0]}') "
+                f"does not occur verbatim in its passage")
     elif name == "subject_last":
         target = _find_span(text, item.subject, spans["stem"])
         if not target:

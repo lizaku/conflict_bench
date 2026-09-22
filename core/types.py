@@ -62,12 +62,17 @@ class DetectionRecord:
     relation: str
     condition: Condition
     method: str
-    score: float                 # higher = predicts context-following (convention!)
-    label: Optional[int] = None  # 1 = model followed context behaviourally
-    score_raw: Optional[float] = None   # uncorrected counterpart of `score`,
-    # for methods whose score is format-corrected against R. `score` is what
-    # the summary AUROC uses; both are reported, because a conclusion that
-    # only survives one of them is a conclusion about the passage template.
+    score: float                 # the PRIMARY score; see the convention below
+    # Convention depends on the run's detection_task (methods/base.py):
+    #   conflict     HIGHER = the passage contradicts the model's knowledge
+    #   arbitration  HIGHER = the model will follow the context
+    label: Optional[int] = None  # conflict: 1 = C (conflicting passage)
+    #                              arbitration: 1 = followed context behaviourally
+    # The two views of the same score, reported side by side. `score` is
+    # whichever one the run's `format_correct` selected; the other is kept so
+    # a conclusion that only survives one of them is visible as exactly that.
+    score_raw: Optional[float] = None        # what was observed
+    score_corrected: Optional[float] = None  # after subtracting the R margin
     extras: dict = field(default_factory=dict)
 
 
@@ -80,15 +85,25 @@ class SteeringRecord:
     method: str
     target: str                  # "use_parametric" | "use_context"
     factor: float
-    margin_before: float         # format-corrected (R subtracted) unless the
-    margin_after: float          # method sets format_correct: false
-    flipped: bool                # sign flip of the corrected margin
-    margin_before_raw: Optional[float] = None   # what was actually observed,
-    margin_after_raw: Optional[float] = None    # before the R subtraction
+    margin_before: float         # the PRIMARY pair: raw unless the run set
+    margin_after: float          # format_correct: true, in which case R is
+    #                              subtracted from both
+    flipped: bool                # sign flip of the primary margin
+    # Both views, always, whichever one `margin_before/after` mirrors:
+    margin_before_raw: Optional[float] = None         # what was observed
+    margin_after_raw: Optional[float] = None
     flipped_raw: Optional[bool] = None
+    margin_before_corrected: Optional[float] = None   # after subtracting R,
+    margin_after_corrected: Optional[float] = None    # None when R is absent
+    flipped_corrected: Optional[bool] = None
     r_offset: Optional[float] = None            # the margin under R itself
     generated: Optional[str] = None
     fluency: Optional[float] = None      # e.g. perplexity of continuation
-    control_margin_after: Optional[float] = None  # norm-matched random direction
-    control_margin_after_raw: Optional[float] = None
+    control_margin_after: Optional[float] = None  # the method's matched control:
+    control_margin_after_raw: Optional[float] = None  # a norm-matched random
+    # direction (activation methods), a placebo instruction of the same shape
+    # (prompting), or the unsteered distribution (the decoding family, which
+    # reduces to it exactly). None means the method declared no control, and
+    # metrics.steering_summary reports specific_effect as NaN rather than
+    # silently equating it with the raw delta.
     extras: dict = field(default_factory=dict)

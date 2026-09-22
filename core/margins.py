@@ -33,7 +33,8 @@ import json
 from pathlib import Path
 
 from conflict_bench.core.types import Condition, ScoredCandidates
-from conflict_bench.core.prompts import build_prompt
+from conflict_bench.core.prompts import (build_prompt,
+                                         continuation as build_continuation)
 
 ALL_CONDITIONS = [Condition.NORMAL, Condition.SUPPORTING,
                   Condition.CONFLICTING, Condition.IRRELEVANT]
@@ -44,10 +45,23 @@ def as_condition(c):
 
 
 class MarginTable:
-    def __init__(self, model, path=None, reference=Condition.IRRELEVANT):
+    def __init__(self, model, path=None, reference=Condition.IRRELEVANT,
+                 correct=False):
         self.model = model
         self.reference = as_condition(reference)
-        self.correct = True   # set False when R is not in the run's conditions
+        # The R correction is OFF by default. It was introduced to remove the
+        # passage *template*'s reweighting of the two answer strings, but R
+        # differs from C on two axes at once - the template AND whether the
+        # passage is about this item at all - so subtracting it also removes
+        # the "a relevant passage is present" effect, which is most of the
+        # signal. Measured consequence on the 400-item pilot: margin(C) - R was
+        # negative for 394/400 items while only 47% of them behaviourally
+        # followed the context, which flattened the margin detector to chance
+        # and left the use_context steering arm with 6 testable items.
+        # Still computed and still reported alongside (set `format_correct:
+        # true`), because a conclusion that only survives one of the two is a
+        # conclusion about the passage template. See CLAUDE.md.
+        self.correct = bool(correct)
         self.path = Path(path) if path else None
         self._cache: dict[tuple, ScoredCandidates] = {}
         self.n_scored = 0
@@ -85,33 +99,53 @@ class MarginTable:
             p = build_prompt(item, condition)
             self._cache[key] = ScoredCandidates(
                 item_id=item.item_id, condition=condition,
-                logp_true=self.model.logp_continuation(p, " " + item.true_answer),
+                logp_true=self.model.logp_continuation(
+                    p, build_continuation(item.true_answer)),
                 logp_cf=self.model.logp_continuation(
-                    p, " " + item.counterfactual_answer))
+                    p, build_continuation(item.counterfactual_answer)))
             self.n_scored += 1
         return self._cache[key]
+
+    def has(self, item, condition) -> bool:
+        """Is this (item, condition) already scored?
+
+        Lets a caller ask for the corrected view *without* triggering a
+        forward pass for a condition the run never asked for.  `scored()`
+        computes on demand, so a bare call would silently score R in a run
+        configured without it.
+        """
+        return (item.item_id, as_condition(condition).value) in self._cache
 
     def margin(self, item, condition) -> float:
         """Raw margin: what was actually observed under this condition."""
         return self.scored(item, condition).margin
 
-    def offset(self, item) -> float:
-        """The format baseline: the margin under the reference condition (R).
+    def reference_margin(self, item):
+        """The margin under R, or None if R was never scored in this run.
 
-        Zero when the reference condition is not part of this run - a run
-        without R reports raw margins only rather than silently correcting
-        against a condition it never scored.
+        Deliberately independent of `self.correct`: whether the correction is
+        the *primary* view and whether it is *available* are two different
+        questions, and the reports want both views whenever R exists.
         """
-        if not self.correct:
-            return 0.0
+        if not self.has(item, self.reference):
+            return None
         return self.margin(item, self.reference)
 
-    def corrected(self, item, condition) -> float:
-        """Margin with the format baseline removed."""
+    def offset(self, item) -> float:
+        """The format baseline as a number to subtract: the R margin, or 0.0
+        when R is not part of this run."""
+        ref = self.reference_margin(item)
+        return 0.0 if ref is None else ref
+
+    def corrected(self, item, condition):
+        """Margin with the format baseline removed, or None if R is absent."""
         condition = as_condition(condition)
-        if self.correct and condition == self.reference:
-            return 0.0
-        return self.margin(item, condition) - self.offset(item)
+        if condition == self.reference:
+            return 0.0 if self.has(item, self.reference) else None
+        ref = self.reference_margin(item)
+        if ref is None:
+            return None
+        return self.margin(item, condition) - ref
 
     def score_all(self, items, conditions=None):
         """Run the full design. Returns the flat list of ScoredCandidates."""
@@ -134,7 +168,9 @@ class MarginTable:
                 row[f"logp_true_{c.value}"] = sc.logp_true
                 row[f"logp_cf_{c.value}"] = sc.logp_cf
                 row[f"margin_{c.value}"] = sc.margin
-            if self.correct and self.reference in conditions:
+            if self.reference in conditions:
+                # written whenever R was scored, not only when it is primary:
+                # both views are reported, always (CLAUDE.md invariant 5)
                 for c in conditions:
                     if c != self.reference:
                         row[f"margin_{c.value}_corr"] = self.corrected(it, c)

@@ -7,6 +7,10 @@
 #   CAD        cad               context_kl          CAD amplifies this shift
 #   AdaCAD     adacad            context_jsd         AdaCAD's adaptive alpha IS this JSD
 #   CK-PLUG    ckplug            confidence_gain     CK-PLUG's gate IS this signal
+#
+# Under detection_task: conflict every detector answers "does this passage
+# contradict what the model knows?", and every steerer answers "given that it
+# does, can you make the model say so anyway?" - see methods/base.py.
 #   CAA        caa               diffmean_proj       same mean-difference vector
 #
 # plus, not optional:
@@ -32,13 +36,66 @@ prompt:
   background_prefix: "Background: "
   separator: "\n\n"
   answer_prefix: ""
+  # Wrap every prompt in the model's own chat template when it has one.
+  # An instruction-tuned model run in raw-completion mode is not in the
+  # regime its instruction-following was trained into. That costs
+  # prompt_instruct most (its whole mechanism IS instruction following)
+  # and inflates the formatting component of confidence_gain's entropy
+  # difference. "auto" = use it when available, "off" = never, "on" =
+  # require it. core/prompts applies it, not core/model, because it owns
+  # the block spans core/positions maps through the offset mapping.
+  chat: auto
+  system: ""
+  # Where a steering instruction goes. Before the passage is what the
+  # literature does (Longpre et al.; CK-PLUG's `instr` schema); wedged
+  # between a long passage and the question it reads as another sentence
+  # of the document rather than a directive to the model.
+  instruction_position: before_context
 
 conditions: [N, S, C, R]
 reference_condition: R
-detection_condition: C
-detection_conditions: [C]
-detection_positions: [end_of_context, last]
-steering_condition: C
+detection_condition: C       # arbitration task only
+detection_conditions: [C]    # arbitration task only
+detection_positions: [end_of_context, answer_mention_last, last]
+
+# ---------------------------------------------------------------- the question
+# Both axes ask one question, so a detector and a steerer are comparable on the
+# same items under the same conditions.
+#
+#   detection_task: conflict     "Does this passage contradict the model's
+#                                 internal knowledge?"  Every item is scored
+#                                 TWICE - once with its supporting passage
+#                                 (label 0) and once with its conflicting one
+#                                 (label 1).  The base rate is 0.5 by
+#                                 construction and the design is paired, so the
+#                                 per-item answer-string constant cancels
+#                                 exactly instead of being estimated away.
+#   detection_task: arbitration  the legacy axis - "will the model follow the
+#                                 context?", scored under C alone against the
+#                                 behavioural label.  Kept reproducible.
+detection_task: conflict
+conflict_condition: C      # the positive class
+support_condition: S       # the negative class
+
+# The R correction is OFF by default and this is deliberate. R differs from C
+# on two axes at once - the passage template AND whether the passage is about
+# this item at all - so subtracting it removes the "a relevant passage is
+# present" effect along with the template effect. Measured on the 400-item
+# pilot: margin(C) - margin(R) was negative for 394/400 items while only 47%
+# of them behaviourally followed the context, which flattened the margin
+# detector to chance and left the use_context steering arm with 6 testable
+# items. R is still scored and the corrected view is still reported in every
+# table beside the raw one (invariant 5); this flag only decides which of the
+# two is PRIMARY. Set it true to reproduce the old numbers.
+format_correct: false
+
+# The steering question: "Given a CONFLICTING passage, can the intervention
+# make the model output the conflicting answer when it otherwise would not?"
+# Both conditions run for every method: C is the measurement, S is the matched
+# specificity control - same item, same dose, but nothing to arbitrate. A
+# method that moves the margin just as hard under S is pushing on the passage,
+# not resolving a conflict. metrics pairs them into conflict_specific_effect.
+steering_conditions: [C, S]
 
 dataset:
   loader: load_confiqa_cloze_clusters
@@ -83,11 +140,19 @@ method_cfg:
 
   prompt_instruct:
     factors: [0, 1]            # variant index, not a dose
+    # its matched control: same block, same slot, no directional claim
+    placebo: "The passage above is provided for reference. Answer the question that follows."
   cad: {}
   adacad:
     factors: [0.5, 1.0, 2.0]   # s=1 is AdaCAD as published
   ckplug:
-    factors: [0.0, 0.25, 0.5, 0.75, 1.0]   # factor IS alpha, and alpha is in [0,1]
+    # factor is a DOSE in [0, 1] like every other steerer: 0 is the neutral
+    # midpoint for both targets, 1 is the full push. Set factor_is_alpha: true
+    # to feed the paper's context-reliance knob in directly instead.
+    factors: [0.0, 0.25, 0.5, 0.75, 1.0]
+    gate_epsilon: 0.0   # Eq. 7 (CG < 0); Appendix B uses -1 / -2 / -3 per model
+    select_top: 0       # Eq. 9 V_head mask; OFF because a masked answer token
+                        # makes the teacher-forced margin -inf. Generation only.
   caa:
     layers: [17, 18, 19]
     orthogonalize: false       # this is the point of `caa` vs `act_add`

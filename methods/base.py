@@ -1,12 +1,30 @@
 """Abstract interfaces + registry.
 
-Two axes, mirroring AxBench's C (detection) and S (steering), but here:
-  C  = "will/does the model follow the context over its parametric answer?"
-       (per-item score; mechanistic methods read activations,
-        output-based methods read samples/logits/verbal reports)
-  S  = "can we push arbitration toward context or toward memory?"
-       (intervention; mechanistic = activation-level,
-        output-based = prompt / decoding / proxy-model level)
+Two axes, mirroring AxBench's C (detection) and S (steering).  Both ask one
+question, so that a detector and a steerer can be compared on the same items
+under the same conditions:
+
+  C  = "Does this passage contradict the model's internal knowledge?"
+       Scored per (item, condition) over the S-vs-C contrast: the same item
+       is presented once with a supporting passage and once with a
+       conflicting one, and the label is which one it was.  The design is
+       paired, so the per-item answer-string constant cancels exactly and the
+       base rate is 0.5 by construction.
+       Score convention: HIGHER = more conflict.
+
+  S  = "Given a conflicting passage, can the intervention make the model
+       output the conflicting answer when it otherwise would not?"
+       Every steerer is applied under C (where the conflict is) and under S
+       (where there is none), so the S arm is a matched specificity control
+       on the same item rather than a separate synthetic baseline.
+
+The legacy arbitration framing - "will the model follow the context?", scored
+under C alone against a behavioural label - is still runnable via
+`detection_task: arbitration`, because the two questions are genuinely
+different and the older numbers should stay reproducible.  Under that task
+the score convention is HIGHER = more context-following; a detector whose
+orientation differs between the two tasks flips on `self.task` (see
+`confidence_gain`, which is the clearest case).
 
 Every method implements one interface so the runner is method-agnostic.
 
@@ -52,6 +70,10 @@ class Method(ABC):
     def __init__(self, model, cfg=None):
         self.model = model
         self.cfg = cfg or {}
+        # "conflict" (S-vs-C) or "arbitration" (the legacy per-item label).
+        # The runner injects it into every method's cfg so a method never has
+        # to guess which question it is being asked.
+        self.task = self.cfg.get("task", "conflict")
 
     def save_artifacts(self, store, tag=""):
         """Persist fitted parameters / tensors. `store` is an ArtifactStore
@@ -61,12 +83,24 @@ class Method(ABC):
 
 
 class Detector(Method):
-    """Produces a scalar 'context-following' score per (item, condition)."""
+    """Produces a scalar score per (item, condition).
 
-    def fit(self, items: list[Item], labels: list[int]):
-        """Train on labelled items (behavioural label: 1 = followed context).
-        Runner guarantees GroupKFold-by-relation: fit() only ever sees
-        train folds. No-op for training-free methods."""
+    HIGHER means more conflict under the `conflict` task, more
+    context-following under `arbitration`.
+    """
+
+    def fit(self, items: list[Item], labels: list[int],
+            conditions: list[Condition] = None):
+        """Train on labelled instances. Runner guarantees
+        GroupKFold-by-relation: fit() only ever sees train folds.
+
+        `conditions[i]` is the condition instance i was presented under, and
+        it is NOT constant under the conflict task - the same item appears
+        once as S and once as C, and the label is exactly which.  A trainable
+        detector that ignores it would read both halves of every pair from the
+        same activations and learn nothing.  None means "all CONFLICTING",
+        the legacy arbitration case.  No-op for training-free methods.
+        """
         pass
 
     @abstractmethod
@@ -86,6 +120,11 @@ class Steerer(Method):
     @abstractmethod
     def steer(self, item: Item, condition: Condition, target: str,
               factor: float) -> SteeringRecord:
+        """`condition` is C for the real measurement and S for the matched
+        specificity control - the same intervention on the same item where
+        there is no conflict to resolve.  A steerer must therefore not assume
+        C; anything that needs "the answer the passage asserts" should ask
+        `core.positions.asserted_answers`."""
         ...
 
     def control(self, item: Item, condition: Condition, target: str,

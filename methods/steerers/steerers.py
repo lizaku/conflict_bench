@@ -1,18 +1,40 @@
 """Steerers: push arbitration toward context or toward memory.
 
 Mechanistic:  act_add (CAA/DiffMean, layers 17-19, orthogonalized v_override)
-Output-based: prompt_instruct, cad (contrastive decoding),
-              ckplug (external repo), csks (external repo, proxy models)
+Output-based: prompt_instruct, cad, adacad, ckplug (contrastive decoding),
+              csks (external repo, proxy models)
 
-Effect metric everywhere: delta(format-corrected margin) + flip rate,
-always against the method's matched control.
+The question every steerer answers:
+
+    Given a CONFLICTING passage, can the intervention make the model output
+    the conflicting answer when it otherwise would not?
+
+so each one runs under BOTH conditions the runner gives it:
+
+    C   the measurement - the conflict the method is supposed to resolve
+    S   the matched specificity control - the same intervention, the same
+        item, the same dose, but a passage that agrees with memory.  A method
+        that moves the margin just as hard under S is not resolving a
+        conflict, it is just pushing on the passage.
+
+`metrics.steering_summary` pairs the two by item and reports
+`conflict_specific_effect = d_margin(C) - d_margin(S)`.  That control is a
+matched *condition*, not a synthetic baseline, and it is the reason the S
+arm is worth its forward passes.
 
 Margin convention (as everywhere else in the repo):
     m = logp(true) - logp(cf)      m > 0 parametric wins, m < 0 context wins
 so a `use_context` success is m0 > 0 -> m1 < 0, and a `use_parametric`
 success is m0 < 0 -> m1 > 0.  Items that already sit on the target side are
 not flippable; that is recorded per item so the flip rate can be read both
-unconditionally and conditioned on flippable items.
+unconditionally and conditioned on flippable items, and `n_flippable` is
+carried into every summary row - a flip rate over 6 items and a flip rate
+over 394 are not the same measurement and must not share a column unlabelled.
+
+Effect metric everywhere: delta(margin) + flip rate, always against the
+method's matched control.  Every steerer declares one; a method that returns
+None gets `specific_effect = NaN` rather than having its raw delta quietly
+promoted into a controlled number.
 """
 import numpy as np
 
@@ -22,14 +44,14 @@ except ImportError:
     torch = None  # container smoke tests only
 
 from conflict_bench.core.types import Item, Condition, SteeringRecord
-from conflict_bench.core.prompts import build_prompt
+from conflict_bench.core.prompts import build_prompt, continuation
 from conflict_bench.methods.base import Steerer, register_steerer
 
 
 def _raw_margin(model, item, condition, prompt_override=None):
     p = prompt_override if prompt_override is not None else build_prompt(item, condition)
-    lp_t = model.logp_continuation(p, " " + item.true_answer)
-    lp_c = model.logp_continuation(p, " " + item.counterfactual_answer)
+    lp_t = model.logp_continuation(p, continuation(item.true_answer))
+    lp_c = model.logp_continuation(p, continuation(item.counterfactual_answer))
     return lp_t - lp_c  # >0 parametric wins
 
 
@@ -42,24 +64,38 @@ def _flippable(m0, target):
 
 
 class _MarginMixin:
-    """Format correction + fluency, shared by every steerer.
+    """The two margin views + fluency, shared by every steerer.
 
-    The R-condition margin is a per-item constant (measured once, unsteered,
-    from the shared MarginTable) subtracted from both margin_before and
-    margin_after.  It leaves delta-margin untouched - the offset cancels - so
-    what it changes is the *sign*, and therefore the flip rate: whether an
-    item counts as flipped should not depend on how the passage template
-    happens to reweight the two answer strings.
+    The R correction subtracts the per-item margin under the irrelevant
+    passage from both margin_before and margin_after.  It cancels out of
+    delta-margin exactly - the offset is a per-item constant - so what it
+    changes is which side of zero an item sits on, i.e. the flip rate.
 
-    Both are recorded.  `record()` below writes the corrected pair, the raw
-    pair, the offset itself, and the flip verdict under each - so a flip rate
-    that only exists after correction is visible as exactly that.
+    It is no longer the default, and the reason is measured rather than
+    theoretical: R differs from C on two axes at once, the passage template
+    AND whether the passage is about this item at all.  Subtracting it removes
+    the second along with the first, and on the 400-item pilot that put
+    394/400 items on the context side of zero while only 47% of them actually
+    behaved that way - which flattened the margin detector to chance and left
+    the use_context arm with 6 testable items.  See core/margins.py.
+
+    So: the RAW pair is primary, the corrected pair is computed and recorded
+    beside it whenever R was scored, and `format_correct: true` swaps which
+    one `margin_before/after` mirrors.  Neither is ever dropped - a flip rate
+    that only exists under one of the two views is visible as exactly that.
     """
 
     def _offset(self, item):
-        if not self.cfg.get("format_correct", True):
-            return 0.0
+        """The R margin, or 0.0 when R was not part of this run.
+
+        Independent of `format_correct`: whether the correction is *primary*
+        and whether it is *available* are different questions, and the reports
+        want both views whenever R exists.
+        """
         return self.model.margins.offset(item)
+
+    def _has_reference(self, item):
+        return self.model.margins.reference_margin(item) is not None
 
     def raw_margin(self, item, condition, prompt_override=None):
         """What is actually observed - no correction."""
@@ -72,12 +108,23 @@ class _MarginMixin:
             - self._offset(item)
 
     def record(self, item, condition, target, factor, m0_raw, m1_raw, **kw):
-        """Build a SteeringRecord carrying both the raw and corrected view."""
+        """Build a SteeringRecord carrying both views and the matched control.
+
+        `control_margin_after_raw=None` means the method declared no control;
+        it stays None so metrics reports specific_effect as NaN instead of
+        silently promoting the raw delta into a controlled number.
+        """
+        have_ref = self._has_reference(item)
         off = self._offset(item)
-        m0, m1 = m0_raw - off, m1_raw - off
+        m0_corr = m0_raw - off if have_ref else None
+        m1_corr = m1_raw - off if have_ref else None
+        use_corr = bool(self.cfg.get("format_correct", False)) and have_ref
+        m0, m1 = (m0_corr, m1_corr) if use_corr else (m0_raw, m1_raw)
+
         extras = kw.pop("extras", {})
         extras.setdefault("flippable", _flippable(m0, target))
         extras.setdefault("flippable_raw", _flippable(m0_raw, target))
+        extras.setdefault("view", "r_corrected" if use_corr else "raw")
         ctrl_raw = kw.pop("control_margin_after_raw", None)
         return SteeringRecord(
             item.item_id, item.relation, condition, self.name, target, factor,
@@ -85,8 +132,15 @@ class _MarginMixin:
             flipped=_flipped(m0, m1, target),
             margin_before_raw=m0_raw, margin_after_raw=m1_raw,
             flipped_raw=_flipped(m0_raw, m1_raw, target),
-            r_offset=off,
-            control_margin_after=None if ctrl_raw is None else ctrl_raw - off,
+            margin_before_corrected=m0_corr, margin_after_corrected=m1_corr,
+            flipped_corrected=(None if not have_ref
+                               else _flipped(m0_corr, m1_corr, target)),
+            r_offset=off if have_ref else None,
+            # the control must live in the SAME view as margin_before/after,
+            # or specific_effect differences two different quantities
+            control_margin_after=(None if ctrl_raw is None
+                                  else (ctrl_raw - off if use_corr
+                                        else ctrl_raw)),
             control_margin_after_raw=ctrl_raw,
             extras=extras, **kw)
 
@@ -283,8 +337,21 @@ class SimpleCAA(ActivationAddition):
 class PromptInstruct(_MarginMixin, Steerer):
     """AxBench's winner and the mandatory baseline: explicit instruction to
     trust (or distrust) the document. Factor is discrete: instruction variants
-    of increasing strength (index into TEMPLATES)."""
+    of increasing strength (index into TEMPLATES).
+
+    Its matched control is a PLACEBO instruction - same block, same position,
+    same rough length, no directional claim.  Without it the comparison is
+    "an instruction" against "nothing inserted", which confounds the
+    instruction's content with the fact that any text was added before the
+    question at all.  This method previously declared no control, and since
+    `specific_effect` filled a missing control with zero, its number was a
+    bare delta-margin sitting in the same column as CAD's controlled one.
+    """
     access = "black-box"
+
+    #: matched for shape and length, directionally inert
+    PLACEBO = ("The passage above is provided for reference. Answer the "
+               "question that follows.")
 
     TEMPLATES = {
         "use_context": [
@@ -314,7 +381,18 @@ class PromptInstruct(_MarginMixin, Steerer):
         return self.record(
             item, condition, target, float(idx), m0, m1, generated=gen,
             fluency=self.fluency(prompt, gen),
+            control_margin_after_raw=self.control(item, condition, target, idx),
             extras={"instruction": instr, "variant_index": idx})
+
+    def control(self, item, condition, target, factor):
+        """Margin after the placebo instruction - the same edit to the prompt
+        with the directional content removed."""
+        placebo = self.cfg.get("placebo", self.PLACEBO)
+        if not placebo:
+            return None
+        return self.raw_margin(
+            item, condition,
+            prompt_override=build_prompt(item, condition, instruction=placebo))
 
 
 class _ContrastiveDecoder(_MarginMixin, Steerer):
@@ -350,9 +428,10 @@ class _ContrastiveDecoder(_MarginMixin, Steerer):
         return float(logp.gather(-1, ids.unsqueeze(-1)).sum())
 
     def decoded_margin(self, item, condition, factor, target):
-        return (self._logp(item, condition, " " + item.true_answer,
-                           factor, target)
-                - self._logp(item, condition, " " + item.counterfactual_answer,
+        return (self._logp(item, condition,
+                           continuation(item.true_answer), factor, target)
+                - self._logp(item, condition,
+                             continuation(item.counterfactual_answer),
                              factor, target))
 
     def steer(self, item, condition, target, factor):
@@ -438,46 +517,126 @@ class AdaptiveContextAwareDecoding(_ContrastiveDecoder):
 class CKPlug(_ContrastiveDecoder):
     """CK-PLUG (Bi et al. 2025, arXiv:2503.15888; github.com/byronBBL/CK-PLUG).
 
-    Reimplemented from the mechanism the paper describes, NOT vendored from
-    their repo - check it against their code before quoting numbers against
-    theirs.
+    Reimplemented from the paper's equations, NOT vendored from their repo -
+    check it against their code before quoting numbers against theirs.
 
-    Two parts:
+    Two parts.
 
-    1. A gate. Per token the *confidence gain* is the entropy drop the passage
-       causes, dH_t = H(p_par,t) - H(p_ctx,t).  dH_t < 0 means the passage made
-       the model less certain, the signature of a knowledge conflict.  Only
-       those tokens are touched; where context and memory agree the
-       distribution is left exactly alone.  That gate is what separates
-       CK-PLUG from CAD, which reweights every token unconditionally.
+    **1. The gate (Eq. 7).**  Per token the confidence gain is
 
-    2. One knob. On gated tokens the two distributions are blended
-       geometrically and renormalized,
+        CG_t = H(p_par,t) - H(p_ctx,t)        [bits, Eqs. 2-4]
 
-           log p = a * log p_ctx + (1 - a) * log p_par,   a in [0, 1]
+    and only tokens with CG_t below the threshold are touched; everywhere
+    else the context distribution passes through untouched.  That gate is
+    what separates CK-PLUG from CAD, which reweights every token
+    unconditionally.  The main text uses CG < 0; Appendix B uses a stricter
+    entropy-relative bound, CG < eps * |H_ctx| with eps in {-1, -2, -3} set
+    per model.  `gate_epsilon` selects between them and defaults to 0.0, the
+    Eq. 7 form.
 
-       so a = 1 is full context reliance, a = 0 full parametric reliance,
-       a = 0.5 a neutral mix.  `factor` IS a here - give this method its own
-       factor list inside [0, 1], because the global alpha sweep means nothing
-       to it - and `use_parametric` mirrors it to 1 - a.
+    Watch `gated_token_rate` in the records.  This harness scores
+    teacher-forced answer tokens inside a prompt whose passage states an
+    answer, and a passage that names an answer *sharpens* the distribution
+    there - so CG > 0 and the token is skipped.  A near-zero gate rate means
+    CK-PLUG is a no-op on exactly the tokens the DV is computed from, which
+    is a property of the measurement, not a bug to patch away.
+
+    **2. The blend (Eqs. 5, 6, 8).**  The paper mixes the parametric
+    log-probs with a *log-ratio*, not with the context log-probs:
+
+        q_para = log p_par
+        q_cont = log p_ctx - log p_par            <- contrastive, Eq. 6
+        F      = alpha * q_para + (1 - alpha) * q_cont
+
+    with alpha = 1 fully parametric and alpha = 0 fully context-reliant.
+    Writing a = 1 - alpha for context reliance, that is
+
+        log p = a * log p_ctx + (1 - 2a) * log p_par
+
+    Note the coefficient on the parametric term: **(1 - 2a), not (1 - a)**.
+    The difference is not cosmetic.  Under the (1 - a) form this class used
+    to implement, a = 1 gives plain log p_ctx - the *unsteered* model - so
+    the method could only ever interpolate between "do nothing" and "go fully
+    parametric", and its entire use_context arm was a no-op by construction.
+    Under the paper's form a = 1 gives log p_ctx - log p_par, a genuine
+    extrapolation away from memory (CAD with amplification 1).
+
+    **Dose semantics.**  `factor` is a dose in [0, 1] like every other
+    steerer here, mapped to a = 0.5 +/- 0.5 * factor so that factor = 0 is
+    the neutral midpoint for BOTH targets and factor = 1 is the full push.
+    Set `factor_is_alpha: true` to feed the paper's alpha in directly
+    instead.  One honest caveat either way: a = 0.5 gives 0.5 * log p_ctx,
+    which has the same *ranking* as the unsteered distribution but not the
+    same probabilities, so unlike `cad` and `adacad` this method does not
+    reduce to the unsteered margin exactly at dose 0.  That is a property of
+    CK-PLUG's formula.  The matched control is the true unsteered margin
+    regardless (see `_ContrastiveDecoder.steer`), so the comparison stays
+    honest; the dose-0 row simply is not identical to it.
+
+    **V_head (Eq. 9).**  The paper restricts the blended scores to the union
+    of the two distributions' top-k sets and sends everything else to -inf.
+    Implemented, but `select_top` defaults to 0 (off), because this harness
+    scores a teacher-forced margin over specific answer strings: any answer
+    token falling outside the mask gets log-prob -inf and the margin becomes
+    non-finite and non-comparable with every other row in the table.  Turn it
+    on only when generating.
     """
 
-    def combine(self, z_ctx, z_par, factor, target):
-        a = float(factor)
-        if target != "use_context":
-            a = 1.0 - a
+    def _alpha(self, factor, target):
+        """-> (a, alpha) where a is context reliance and alpha the paper's."""
+        f = float(factor)
+        if self.cfg.get("factor_is_alpha", False):
+            # the repo's original parameterisation: factor IS the
+            # context-reliance knob a, so a = 0.5 is neutral, a = 1 full
+            # context, a = 0 full parametric (the paper's alpha = 1 - a)
+            a = f if target == "use_context" else 1.0 - f
+        else:
+            half = 0.5 * min(max(f, 0.0), 1.0)
+            a = 0.5 + half if target == "use_context" else 0.5 - half
         a = min(max(a, 0.0), 1.0)
+        return a, 1.0 - a
+
+    @staticmethod
+    def _v_head(q_para, q_cont, k):
+        """Eq. 9: the union of the two top-k candidate sets."""
+        k = min(int(k), q_para.shape[-1])
+        keep = torch.zeros_like(q_para, dtype=torch.bool)
+        for q in (q_para, q_cont):
+            keep |= q >= q.topk(k, dim=-1).values[..., -1:]
+        return keep
+
+    def combine(self, z_ctx, z_par, factor, target):
+        a, alpha = self._alpha(factor, target)
         logp_ctx = torch.log_softmax(z_ctx, -1)
         logp_par = torch.log_softmax(z_par, -1)
-        h_ctx = -(logp_ctx.exp() * logp_ctx).sum(-1)
-        h_par = -(logp_par.exp() * logp_par).sum(-1)
-        conflict = (h_par - h_ctx) < 0            # negative confidence gain
-        self._last_gate_rate = float(conflict.float().mean())
-        blended = a * logp_ctx + (1 - a) * logp_par
-        return torch.where(conflict.unsqueeze(-1), blended, logp_ctx)
+
+        q_para = logp_par                       # Eq. 5
+        q_cont = logp_ctx - logp_par            # Eq. 6
+        blended = alpha * q_para + (1.0 - alpha) * q_cont    # Eq. 8
+
+        k = int(self.cfg.get("select_top", 0) or 0)
+        if k > 0:
+            blended = blended.masked_fill(
+                ~self._v_head(q_para, q_cont, k), float("-inf"))
+
+        # Eq. 7 / Appendix B: gate on the confidence gain, in bits
+        ln2 = float(np.log(2.0))
+        h_ctx = -(logp_ctx.exp() * logp_ctx).sum(-1) / ln2
+        h_par = -(logp_par.exp() * logp_par).sum(-1) / ln2
+        cg = h_par - h_ctx
+        eps = float(self.cfg.get("gate_epsilon", 0.0))
+        gated = cg < (eps * h_ctx.abs())
+        self._last_gate_rate = float(gated.float().mean())
+        self._last_cg = float(cg.mean())
+        self._last_alpha = alpha
+        return torch.where(gated.unsqueeze(-1), blended, logp_ctx)
 
     def steer_extras(self, item, condition, factor, target):
-        return {"alpha": factor if target == "use_context" else 1.0 - factor,
+        return {"alpha": getattr(self, "_last_alpha", None),
+                "context_reliance": 1.0 - getattr(self, "_last_alpha", 0.0),
+                "gate_epsilon": float(self.cfg.get("gate_epsilon", 0.0)),
+                "select_top": int(self.cfg.get("select_top", 0) or 0),
+                "mean_confidence_gain_bits": getattr(self, "_last_cg", None),
                 "gated_token_rate": getattr(self, "_last_gate_rate", None)}
 
 

@@ -64,7 +64,8 @@ class ModelWrapper:
     def __init__(self, model_name="meta-llama/Llama-3.1-8B-Instruct",
                  device="auto", dtype="auto", cache_dir=None,
                  activation_cache_dir=None, margin_table_path=None,
-                 reference_condition="R", trust_remote_code=False,
+                 reference_condition="R", format_correct=False,
+                 trust_remote_code=False,
                  revision=None, load_kwargs=None, tokenizer_name=None):
         from transformers import AutoModelForCausalLM, AutoTokenizer
         self.model_name = model_name
@@ -84,6 +85,12 @@ class ModelWrapper:
             **tok_kw)
         if self.tok.pad_token_id is None:
             self.tok.pad_token = self.tok.eos_token
+        # core/prompts applies the chat template itself (it owns the block
+        # spans that core/positions maps through the offset mapping, so the
+        # wrapping cannot happen later without invalidating every named
+        # probe position). It needs the tokenizer to do that.
+        from conflict_bench.core import prompts as _prompts
+        _prompts.bind_tokenizer(self.tok)
         self.model = AutoModelForCausalLM.from_pretrained(model_name, **kw)
         if "device_map" not in kw:
             self.model.to(self.device)
@@ -97,7 +104,8 @@ class ModelWrapper:
         # the N/S/C/R teacher-forced margins, scored once and shared by every
         # method that wants them (detectors, steerers, the R correction)
         self.margins = MarginTable(self, margin_table_path,
-                                   reference=reference_condition)
+                                   reference=reference_condition,
+                                   correct=format_correct)
 
     @classmethod
     def from_config(cls, cfg, activation_cache_dir=None,
@@ -113,6 +121,7 @@ class ModelWrapper:
         spec.setdefault("activation_cache_dir", activation_cache_dir)
         spec.setdefault("margin_table_path", margin_table_path)
         spec.setdefault("reference_condition", cfg.get("reference_condition", "R"))
+        spec.setdefault("format_correct", cfg.get("format_correct", False))
         return cls(**spec)
 
     def describe(self):

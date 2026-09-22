@@ -184,7 +184,7 @@ def load_confiqa(path, apply_qc=True, min_alias_len=3):
     return items, dropped
 
 
-def first_token_collisions(items, tokenizer, answer_prefix=" "):
+def first_token_collisions(items, tokenizer, answer_prefix=None):
     """Item ids whose true and cf answers share a first token.
 
     CAD/CK-PLUG score a first-token margin, so a collision item has a
@@ -192,6 +192,11 @@ def first_token_collisions(items, tokenizer, answer_prefix=" "):
     exact set depends on the tokenizer, so it is computed per model rather
     than shipped as a static id list.
     """
+    if answer_prefix is None:
+        # must match what the margin is actually scored on: a chat template
+        # opens the assistant turn for us, so there is no leading space there
+        from conflict_bench.core import prompts as _prompts
+        answer_prefix = "" if _prompts.DEFAULT.uses_chat() else " "
     hits = []
     for it in items:
         t = tokenizer(answer_prefix + it.true_answer,

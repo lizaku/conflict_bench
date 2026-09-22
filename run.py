@@ -119,10 +119,16 @@ def run_conditions(cfg, model, items, labels, out):
     conditions = [margins_mod.as_condition(c)
                   for c in cfg.get("conditions", ["N", "S", "C", "R"])]
     table = model.margins
-    if table.reference not in conditions:
-        table.correct = False
+    have_ref = table.reference in conditions
+    # `correct` selects which view is PRIMARY; the other is reported beside it
+    # whenever R was scored at all (CLAUDE.md invariant 5).
+    table.correct = bool(cfg.get("format_correct", False)) and have_ref
+    if not have_ref:
         print(f"[cond] reference condition {table.reference.value} not in "
-              f"conditions - reporting raw margins only, no correction")
+              f"conditions - raw margins only, no corrected view available")
+    elif not table.correct:
+        print(f"[cond] R scored and the corrected view reported alongside, "
+              f"but RAW margins are primary (format_correct: false)")
     t0 = time.time()
     table.score_all(items, conditions)
     rows = table.rows(items, conditions, labels)
@@ -137,6 +143,67 @@ def run_conditions(cfg, model, items, labels, out):
     return summ
 
 
+def method_cfg(cfg, name):
+    """A method's config block with the run-level settings folded in.
+
+    `task` and `format_correct` are properties of the RUN, not of a method, so
+    the runner injects them rather than making every method reach back into
+    the global config (or, worse, default them differently from each other).
+    An explicit entry in `method_cfg:` still wins.
+    """
+    mcfg = dict(cfg.get("method_cfg", {}).get(name, {}))
+    mcfg.setdefault("task", cfg.get("detection_task", "conflict"))
+    mcfg.setdefault("format_correct", cfg.get("format_correct", False))
+    return mcfg
+
+
+def detection_instances(cfg, items, labels):
+    """The (item, condition, label) instances the detection axis is scored on.
+
+    Two tasks, and they are genuinely different questions:
+
+    `conflict` (default) - "Does this passage contradict the model's internal
+        knowledge?"  Every item is presented TWICE, once with its supporting
+        passage and once with its conflicting one, and the label is which.
+        Three things follow, all of them improvements on the arbitration
+        framing:
+          - the base rate is exactly 0.5 by construction, so the relation
+            base-rate control has nothing to exploit;
+          - the design is paired - both instances share the item, the
+            question, the template and both answer strings - so the per-item
+            answer-string constant cancels exactly.  That is what the R
+            correction was trying to achieve by subtraction, and it is why R
+            is no longer needed here;
+          - both halves of a pair carry the same relation, so GroupKFold puts
+            them in the same fold and a pair is never split across train/test.
+
+    `arbitration` (legacy) - "Will the model follow the context?"  One
+        instance per item under C, labelled by what the model actually
+        generated.  Kept so the earlier numbers stay reproducible.
+
+    One caveat worth keeping in view for the conflict task: `bow` stops being
+    a null and becomes close to an oracle, because whether a passage
+    contradicts is partly decidable from the passage text alone.  GroupKFold
+    by relation blunts that but does not remove it, so "beats BOW" is a
+    weaker claim here than it is under arbitration.  Read the BOW row as a
+    ceiling on the text-only route, not as a floor a probe must clear.
+    """
+    task = cfg.get("detection_task", "conflict")
+    if task == "arbitration":
+        cond = margins_mod.as_condition(cfg.get("detection_condition", "C"))
+        return task, [(i, cond, int(y)) for i, y in enumerate(labels)]
+    if task != "conflict":
+        raise ValueError(
+            f"detection_task '{task}' is neither 'conflict' nor 'arbitration'")
+    pos = margins_mod.as_condition(cfg.get("conflict_condition", "C"))
+    neg = margins_mod.as_condition(cfg.get("support_condition", "S"))
+    inst = []
+    for i in range(len(items)):
+        inst.append((i, neg, 0))
+        inst.append((i, pos, 1))
+    return task, inst
+
+
 def detection_jobs(cfg):
     """The (detector, position, condition) grid to run.
 
@@ -149,16 +216,23 @@ def detection_jobs(cfg):
     instead of an assumption in the config.
     """
     positions = cfg.get("detection_positions", ["end_of_context", "last"])
-    conditions = [margins_mod.as_condition(c) for c in
-                  cfg.get("detection_conditions",
-                          [cfg.get("detection_condition", "C")])]
+    # Under the conflict task the condition is part of the INSTANCE (S and C
+    # are the two classes), so there is nothing to sweep and the job carries
+    # condition=None, meaning "whatever the instance says". The sweep is
+    # arbitration-only, where the condition is fixed and the label is not.
+    if cfg.get("detection_task", "conflict") == "conflict":
+        conditions = [None]
+    else:
+        conditions = [margins_mod.as_condition(c) for c in
+                      cfg.get("detection_conditions",
+                              [cfg.get("detection_condition", "C")])]
     jobs = []
     for name in cfg.get("detectors", []):
         if name not in DETECTORS:
             print(f"[detect] unknown detector '{name}' - skipping")
             continue
         cls = DETECTORS[name]
-        mcfg = dict(cfg.get("method_cfg", {}).get(name, {}))
+        mcfg = method_cfg(cfg, name)
         # a detector with no position has nothing to sweep; one pinned in
         # method_cfg keeps its pin
         pos_list = ([mcfg["position"]] if "position" in mcfg
@@ -168,7 +242,7 @@ def detection_jobs(cfg):
                 key = name
                 if len(pos_list) > 1:
                     key += f"@{pos}"
-                if len(conditions) > 1:
+                if cond is not None and len(conditions) > 1:
                     key += f"|{cond.value}"
                 jcfg = dict(mcfg)
                 if pos is not None:
@@ -208,7 +282,7 @@ def attach_readout_control(det_summ, readout_method="logit_lens"):
     return det_summ
 
 
-def detection_item_mask(cfg, model, items, jobs, out):
+def detection_item_mask(cfg, model, items, jobs, instances, out):
     """Items resolvable at EVERY swept position/condition.
 
     Some items have no verbatim mention of their counterfactual answer in the
@@ -223,8 +297,17 @@ def detection_item_mask(cfg, model, items, jobs, out):
     The whole detection table then sits on one item set, and what was dropped
     is written to detection_dropped.json rather than silently absorbed.
     """
-    wanted = {(j["position"], j["condition"]) for j in jobs
-              if j["position"] is not None}
+    # a job with condition=None (the conflict task) is scored under every
+    # instance condition, so the position has to resolve under all of them or
+    # the two halves of a pair would be measured over different item sets
+    inst_conds = sorted({c for _, c, _ in instances},
+                        key=lambda c: c.value)
+    wanted = set()
+    for j in jobs:
+        if j["position"] is None:
+            continue
+        for c in (inst_conds if j["condition"] is None else [j["condition"]]):
+            wanted.add((j["position"], c))
     if not wanted:
         return list(range(len(items))), []
     keep, dropped = [], []
@@ -246,49 +329,80 @@ def detection_item_mask(cfg, model, items, jobs, out):
 
 
 def run_detection(cfg, model, items, labels, groups, out, artifacts):
+    """Score every detector over the run's detection instances.
+
+    The unit is an INSTANCE - an (item, condition) pair with a label - not an
+    item, because under the conflict task the same item appears twice, once
+    as S and once as C, and the label is which one it was.  Everything
+    downstream (folds, AUROC, the base-rate control) works on instances, and
+    the relation groups are carried per instance so GroupKFold keeps both
+    halves of a pair in the same fold.
+    """
     det_records, det_summ = [], {}
     n_splits = cfg.get("n_splits", 5)
+    task, instances = detection_instances(cfg, items, labels)
     jobs = detection_jobs(cfg)
-    keep, dropped = detection_item_mask(cfg, model, items, jobs, out)
-    items = [items[i] for i in keep]
-    labels = [labels[i] for i in keep]
-    groups = [groups[i] for i in keep]
-    if not items:
-        print("[detect] no items survive the position sweep - skipping")
+    keep, dropped = detection_item_mask(cfg, model, items, jobs, instances, out)
+    keep_set = set(keep)
+    instances = [(i, c, y) for (i, c, y) in instances if i in keep_set]
+    if not instances:
+        print("[detect] no instances survive the position sweep - skipping")
+        return {}
+
+    inst_items = [items[i] for i, _, _ in instances]
+    inst_conds = [c for _, c, _ in instances]
+    inst_labels = [y for _, _, y in instances]
+    inst_groups = [groups[i] for i, _, _ in instances]
+    n = len(instances)
+    pos_rate = float(np.mean(inst_labels))
+    print(f"[detect] task={task}: {n} instances over {len(items)} items, "
+          f"{len(set(inst_groups))} relations, positive rate {pos_rate:.3f}")
+    if len(set(inst_labels)) < 2:
+        print("[detect] instances are single-class - nothing to score")
         return {}
 
     for job in jobs:
         key, name, cls, mcfg = job["key"], job["method"], job["cls"], job["cfg"]
-        cond = job["condition"]
+        # condition=None means "use the instance's own condition" (conflict
+        # task); a fixed condition is the arbitration sweep
+        job_cond = job["condition"]
+        conds = inst_conds if job_cond is None else [job_cond] * n
         t0 = time.time()
         store = artifacts.sub(key.replace("|", "_").replace("@", "_at_"))
-        scores = np.full(len(items), np.nan)
-        scores_raw = np.full(len(items), np.nan)
+        scores = np.full(n, np.nan)
+        scores_raw = np.full(n, np.nan)
+        scores_corr = np.full(n, np.nan)
         records = []
+
+        def take(r, i):
+            scores[i] = r.score
+            if r.score_raw is not None:
+                scores_raw[i] = r.score_raw
+            if r.score_corrected is not None:
+                scores_corr[i] = r.score_corrected
+            records.append(r)
+
         try:
             if cls.requires_training:
-                for k, (tr, te) in enumerate(
-                        group_folds(items, labels, groups, n_splits)):
+                folds = group_folds(inst_items, inst_labels, inst_groups,
+                                    n_splits)
+                for k, (tr, te) in enumerate(folds):
                     D = cls(model, mcfg)
-                    D.fit([items[i] for i in tr], [labels[i] for i in tr])
+                    D.fit([inst_items[i] for i in tr],
+                          [inst_labels[i] for i in tr],
+                          conditions=[conds[i] for i in tr])
                     D.save_artifacts(store, tag=f"fold{k}_")
                     for i in te:
-                        r = D.score(items[i], cond)
-                        r.label = labels[i]
+                        r = D.score(inst_items[i], conds[i])
+                        r.label = inst_labels[i]
                         r.extras["fold"] = k
-                        scores[i] = r.score
-                        if r.score_raw is not None:
-                            scores_raw[i] = r.score_raw
-                        records.append(r)
+                        take(r, i)
             else:
                 D = cls(model, mcfg)
-                for i, (it, y) in enumerate(zip(items, labels)):
-                    r = D.score(it, cond)
-                    r.label = y
-                    scores[i] = r.score
-                    if r.score_raw is not None:
-                        scores_raw[i] = r.score_raw
-                    records.append(r)
+                for i in range(n):
+                    r = D.score(inst_items[i], conds[i])
+                    r.label = inst_labels[i]
+                    take(r, i)
                 D.save_artifacts(store)
         except NotImplementedError as e:
             print(f"[detect] {key}: not implemented ({e}) - skipping")
@@ -303,21 +417,33 @@ def run_detection(cfg, model, items, labels, groups, out, artifacts):
 
         det_records.extend(records)
         store.jsonl("scores.jsonl", [r.__dict__ for r in records])
-        row = metrics.grouped_auroc(scores, labels, groups, n_splits=n_splits)
-        row.update(method=name, condition=cond.value,
+        row = metrics.grouped_auroc(scores, inst_labels, inst_groups,
+                                    n_splits=n_splits)
+        row.update(method=name, task=task,
+                   condition=("instance" if job_cond is None
+                              else job_cond.value),
                    position=(str(job["position"])
                              if job["position"] is not None else None),
                    layer=mcfg.get("layer"), primary=job["primary"],
-                   n_items=len(items), n_items_dropped=len(dropped),
+                   n_items=len(items), n_instances=n,
+                   positive_rate=pos_rate, n_items_dropped=len(dropped),
                    is_readout_position=positions_mod.is_readout(job["position"])
                    if job["position"] is not None else None)
-        if not np.isnan(scores_raw).all():
-            # the same detector before its R correction - reported beside the
-            # corrected number, never instead of it
-            raw = metrics.grouped_auroc(scores_raw, labels, groups,
+        # BOTH views of a format-corrected score, always, never one instead of
+        # the other - whichever one `score` mirrors is named by `view`.
+        primary_is_corr = bool(mcfg.get("format_correct", False))
+        row["view"] = "r_corrected" if primary_is_corr else "raw"
+        for label, arr in (("raw", scores_raw), ("corrected", scores_corr)):
+            if np.isnan(arr).all():
+                continue
+            alt = metrics.grouped_auroc(arr, inst_labels, inst_groups,
                                         n_splits=n_splits)
-            row.update(auroc_raw=raw["auroc"], auroc_raw_std=raw["auroc_std"],
-                       auroc_correction_gain=row["auroc"] - raw["auroc"])
+            row[f"auroc_{label}"] = alt["auroc"]
+            row[f"auroc_{label}_std"] = alt["auroc_std"]
+        if not np.isnan(row.get("auroc_raw", np.nan)) and \
+                not np.isnan(row.get("auroc_corrected", np.nan)):
+            row["auroc_correction_gain"] = (row["auroc_corrected"]
+                                            - row["auroc_raw"])
         row["seconds"] = round(time.time() - t0, 1)
         det_summ[key] = row
         print(f"[detect] {key}: auroc={row['auroc']:.3f} "
@@ -333,20 +459,44 @@ def run_detection(cfg, model, items, labels, groups, out, artifacts):
                                    ensure_ascii=False) + "\n")
     if det_summ:
         df = pd.DataFrame(det_summ).T
-        front = [c for c in ("method", "position", "condition", "layer",
-                             "auroc", "base_rate_auroc", "readout_auroc",
-                             "auroc_over_readout", "is_readout_position")
+        front = [c for c in ("method", "task", "position", "condition",
+                             "layer", "view", "auroc", "base_rate_auroc",
+                             "readout_auroc", "auroc_over_readout",
+                             "auroc_raw", "auroc_corrected", "accuracy",
+                             "majority_accuracy", "n_instances")
                  if c in df.columns]
         df = df[front + [c for c in df.columns if c not in front]]
-        df.to_csv(out / "detection_summary.csv")
+        df.to_csv(out / "detection_summary.csv", index=False)
     return det_summ
 
 
 def run_steering(cfg, model, items, labels, groups, out, artifacts):
+    """Every steerer x every target x every dose x every condition.
+
+    The condition loop is the point.  The benchmark's steering question is
+
+        Given a CONFLICTING passage, can the intervention make the model
+        output the conflicting answer when it otherwise would not?
+
+    and "otherwise would not" needs a measurement, not an assumption.  So each
+    steerer runs under C (the conflict it is meant to resolve) and under S
+    (the same item, same dose, but a passage that agrees with memory).  The S
+    arm is a matched specificity control: a method that shifts the margin just
+    as hard when there is nothing to arbitrate is pushing on the passage, not
+    resolving a conflict.  `metrics.steering_summary` pairs them by item.
+
+    Both targets always run.  Which one a method "wins" on is a property of
+    the report, not of the design - and collapsing to the winner by argmax is
+    exactly how a 4-of-6-items flip rate came to outrank a 390-of-394 one, so
+    the summary keeps every (target, condition) cell and carries n_flippable
+    beside every rate.
+    """
     steer_records = []
     factors = cfg.get("factors", [0.5, 1.0, 2.0, 4.0])
     targets = cfg.get("targets", ["use_parametric", "use_context"])
-    steer_cond = margins_mod.as_condition(cfg.get("steering_condition", "C"))
+    steer_conds = [margins_mod.as_condition(c) for c in
+                   cfg.get("steering_conditions",
+                           [cfg.get("steering_condition", "C")])]
     n_splits = cfg.get("n_splits", 5)
 
     for name in cfg.get("steerers", []):
@@ -355,7 +505,7 @@ def run_steering(cfg, model, items, labels, groups, out, artifacts):
             continue
         t0 = time.time()
         cls = STEERERS[name]
-        mcfg = cfg.get("method_cfg", {}).get(name, {})
+        mcfg = method_cfg(cfg, name)
         store = artifacts.sub(name)
         # prompt_instruct's factor is a discrete variant index, not a dose;
         # let a method declare its own sweep instead of re-running the same
@@ -386,19 +536,24 @@ def run_steering(cfg, model, items, labels, groups, out, artifacts):
                 failed = f"fit failed ({type(e).__name__}: {e})"
                 break
             S.save_artifacts(store, tag=f"fold{k}_" if len(folds) > 1 else "")
-            for target in targets:
-                for factor in method_factors:
-                    for i in te:
-                        try:
-                            rec = S.steer(items[i], steer_cond, target, factor)
-                        except NotImplementedError as e:
-                            failed = f"steer not implemented ({e})"
+            for steer_cond in steer_conds:
+                for target in targets:
+                    for factor in method_factors:
+                        for i in te:
+                            try:
+                                rec = S.steer(items[i], steer_cond, target,
+                                              factor)
+                            except NotImplementedError as e:
+                                failed = f"steer not implemented ({e})"
+                                break
+                            except Exception as e:
+                                failed = (f"steer failed "
+                                          f"({type(e).__name__}: {e})")
+                                break
+                            rec.extras.setdefault("fold", k)
+                            steer_records.append(rec)
+                        if failed:
                             break
-                        except Exception as e:
-                            failed = f"steer failed ({type(e).__name__}: {e})"
-                            break
-                        rec.extras.setdefault("fold", k)
-                        steer_records.append(rec)
                     if failed:
                         break
                 if failed:
@@ -414,7 +569,9 @@ def run_steering(cfg, model, items, labels, groups, out, artifacts):
         store.jsonl("records.jsonl",
                     [r.__dict__ for r in steer_records[n_before:]])
         print(f"[steer] {name}: {len(steer_records) - n_before} records "
-              f"in {round(time.time() - t0, 1)}s")
+              f"over {len(steer_conds)} conditions x {len(targets)} targets "
+              f"x {len(method_factors)} doses in "
+              f"{round(time.time() - t0, 1)}s")
     return steer_records
 
 
@@ -427,11 +584,14 @@ def main(cfg_path):
                 "started": time.strftime("%Y-%m-%d %H:%M:%S")}
 
     prompts.configure(**(cfg.get("prompt") or {}))
-    manifest["prompt"] = prompts.DEFAULT.as_dict()
 
     model = ModelWrapper.from_config(
         cfg, activation_cache_dir=out / "activations",
         margin_table_path=out / "margin_table.jsonl")
+    # AFTER the model: ModelWrapper binds the tokenizer, and only then does
+    # `chat: auto` resolve - snapshotting the spec earlier records
+    # chat_active: false for a run that in fact used the chat template
+    manifest["prompt"] = prompts.DEFAULT.as_dict()
     manifest["model"] = model.describe()
     print(f"[model] {manifest['model']}")
 

@@ -4,7 +4,16 @@ Mechanistic:   linear_probe, diffmean_proj  (residual-stream, GroupKFold outside
 Grey-box:      margin, confidence_gain      (log-probs / entropy only)
 Black-box:     semantic_entropy, selfcheck_nli, p_true  (samples / verbal)
 
-Score convention: HIGHER = more context-following predicted.
+Score convention depends on the task the runner configured (methods/base.py):
+  conflict     (default)  HIGHER = the passage contradicts what the model knows
+  arbitration  (legacy)   HIGHER = the model will follow the context
+
+Most detectors point the same way under both - `margin`, the divergences and
+`logit_lens` all get larger when the passage pushes away from the parametric
+answer, whether you read that as "there is a conflict" or as "the context is
+winning".  Two do not, and they flip explicitly on `self.task`:
+`confidence_gain` and `p_true`.  Trainable detectors (`bow`, `linear_probe`,
+`diffmean_proj`) learn the orientation from the labels and need no flip.
 
 Prompt construction lives in core.prompts (one source of truth for every
 method and every condition); `build_prompt` is re-exported here because the
@@ -18,24 +27,40 @@ except ImportError:
     torch = None  # container smoke tests only
 
 from conflict_bench.core.types import Item, Condition, DetectionRecord
-from conflict_bench.core.prompts import build_prompt  # noqa: F401 (re-export)
+from conflict_bench.core.prompts import (  # noqa: F401 (re-exported)
+    build_prompt, continuation, wrap_chat)
 from conflict_bench.methods.base import Detector, register_detector
+
+
+def _entropy_bits(z):
+    """Shannon entropy of softmax(z) in bits - CK-PLUG Eqs. 2-3 use log2.
+
+    Full vocabulary, no top-k truncation and no normalisation by log|V|: the
+    paper's top-k mask applies to the decoder's candidate set (Eq. 9), never
+    to the entropy.
+    """
+    logp = torch.log_softmax(z, -1)
+    return float(-(logp.exp() * logp).sum() / float(np.log(2.0)))
 
 
 # ---------------------------------------------------------------- grey-box
 @register_detector("margin")
 class MarginBaseline(Detector):
-    """Teacher-forced margin - the v3 DV itself, the floor every fancier
-    detector must beat.
+    """Teacher-forced margin - the DV itself, the floor every fancier detector
+    must beat.
 
-    Reported twice, because the two numbers answer different questions:
-      score_raw = -(margin under C)        what was actually observed
-      score     = -(margin under C - margin under R)   the part attributable
-                  to the conflict rather than to the passage template
+        m = logp(true) - logp(cf);  score = -m
 
-    Sign is negated so that HIGHER = more context-following, the convention
-    every detector in this file follows.  Both come out of the shared
-    MarginTable, so R is scored once per item for the whole run.
+    so HIGHER means the passage is pulling away from the parametric answer.
+    That reads correctly under both tasks - as "this passage contradicts what
+    I know" under `conflict`, and as "the context is winning" under
+    `arbitration` - so no orientation flip is needed.
+
+    Reported in both views, always.  `score_raw` is what was observed;
+    `score_corrected` subtracts the margin under R.  Which one is primary is
+    the run's `format_correct` setting, and it now defaults to RAW - see
+    core/margins.py for why the R correction stopped being the default.  Both
+    come out of the shared MarginTable, so R is scored once per item per run.
     """
     access = "grey-box"
 
@@ -45,42 +70,77 @@ class MarginBaseline(Detector):
         raw = -sc.margin
         extras = {"logp_true": sc.logp_true, "logp_cf": sc.logp_cf,
                   "margin_raw": sc.margin}
-        corrected = raw
-        if self.cfg.get("format_correct", True):
+        corrected = None
+        if table.reference != condition and table.has(item, table.reference):
             ref = table.scored(item, table.reference)
-            corrected = -table.corrected(item, condition)
+            corrected = -(sc.margin - ref.margin)
             extras.update(reference_condition=table.reference.value,
                           logp_true_ref=ref.logp_true,
                           logp_cf_ref=ref.logp_cf,
                           margin_ref=ref.margin,
                           margin_corrected=-corrected)
+        use_corr = self.cfg.get("format_correct", False) and corrected is not None
         return DetectionRecord(item.item_id, item.relation, condition,
-                               self.name, score=corrected, score_raw=raw,
+                               self.name,
+                               score=corrected if use_corr else raw,
+                               score_raw=raw, score_corrected=corrected,
                                extras=extras)
 
 
 @register_detector("confidence_gain")
 class ConfidenceGain(Detector):
-    """CK-PLUG's conflict signal: entropy shift of next-token distribution
-    after context insertion (Bi et al. 2025, arXiv:2503.15888).
-    Negative gain => conflict => model being pulled by context."""
+    """CK-PLUG's confidence gain (Bi et al. 2025, arXiv:2503.15888, Eq. 4):
+
+        CG = H(p(x | question)) - H(p(x | passage, question))
+
+    i.e. how much the passage sharpened the next-token distribution, in bits.
+    CG < 0 means inserting the passage made the model *less* certain, which
+    the paper takes as the signature of a knowledge conflict; CG > 0 means the
+    passage agreed with what the model already believed.
+
+    Orientation is the thing to get right here, because it is opposite under
+    the two tasks and the paper only ever defines it for one of them:
+
+      conflict (S-vs-C):  the paper's own question.  A supporting passage
+        sharpens (CG > 0), a conflicting one confuses (CG < 0), so
+        score = -CG.
+      arbitration:        every item already has a conflicting passage and the
+        question is who won.  A model that *commits* to the context is
+        confident about the counterfactual, so H_ctx is LOW and CG is
+        positive.  score = +CG.
+
+    Using the paper's sign under the arbitration task is what produced a
+    systematically below-chance AUROC (0.466 on the 400-item pilot, i.e.
+    0.534 the other way up).
+
+    Two caveats the paper shares and this implementation inherits.  It reports
+    no AUROC for CG as a classifier anywhere - CG is validated only as a gate
+    for the decoder - and it concedes that "the changes under conflict
+    conditions are less pronounced", so most of the separation comes from the
+    supporting side.  And the two prompts differ by more than the passage: N
+    is a bare question while S/C carry the `Background: ` block, so part of
+    every entropy difference is formatting.  Their released code has the same
+    asymmetry; it is a noise floor, not a bug, but it caps what this can do.
+
+    Entropy is in bits (log base 2) to match Eqs. 2-3, so `H_*` here is on the
+    same scale as the epsilon thresholds in the paper's Appendix B and as
+    `ckplug`'s gate.  The base is irrelevant to AUROC and matters only if the
+    numbers are read against theirs.
+    """
     access = "grey-box"
 
     def score(self, item, condition):
-        import torch.nn.functional as F
-        stem_logits = self.model.next_token_logits(
+        z_par = self.model.next_token_logits(
             build_prompt(item, Condition.NORMAL))
-        ctx_logits = self.model.next_token_logits(build_prompt(item, condition))
-
-        def h(z):
-            return -(F.softmax(z, -1) * F.log_softmax(z, -1)).sum().item()
-
-        h_stem, h_ctx = h(stem_logits), h(ctx_logits)
-        gain = h_stem - h_ctx  # >0: context sharpened the prediction
-        # conflict signal: sharpened toward WHAT? combine with margin sign.
+        z_ctx = self.model.next_token_logits(build_prompt(item, condition))
+        h_par, h_ctx = _entropy_bits(z_par), _entropy_bits(z_ctx)
+        cg = h_par - h_ctx              # paper's Eq. 4, in bits
+        score = cg if self.task == "arbitration" else -cg
         return DetectionRecord(item.item_id, item.relation, condition,
-                               self.name, score=-gain,
-                               extras={"H_stem": h_stem, "H_ctx": h_ctx})
+                               self.name, score=float(score),
+                               extras={"H_parametric": h_par, "H_context": h_ctx,
+                                       "confidence_gain": float(cg),
+                                       "task": self.task})
 
 
 @register_detector("context_jsd")
@@ -176,7 +236,17 @@ class BagOfWords(Detector):
             return question
         return passage + "\n" + question
 
-    def fit(self, items, labels, condition=Condition.CONFLICTING):
+    @staticmethod
+    def _conds(items, conditions):
+        """Per-instance conditions, defaulting to all-C (arbitration)."""
+        if conditions is None:
+            return [Condition.CONFLICTING] * len(items)
+        if len(conditions) != len(items):
+            raise ValueError(
+                f"conditions has length {len(conditions)}, items {len(items)}")
+        return list(conditions)
+
+    def fit(self, items, labels, conditions=None):
         from sklearn.feature_extraction.text import TfidfVectorizer
         from sklearn.linear_model import LogisticRegression
         from sklearn.pipeline import make_pipeline
@@ -184,7 +254,8 @@ class BagOfWords(Detector):
         if len(np.unique(y)) < 2:
             raise ValueError(
                 f"bow: train fold is single-class ({int(y.sum())}/{len(y)} "
-                f"context-followers)")
+                f"positive) - check context_following_rate (arbitration) or "
+                f"that both S and C instances reached fit() (conflict)")
         vec = TfidfVectorizer(
             lowercase=True,
             ngram_range=tuple(self.cfg.get("ngram_range", (1, 2))),
@@ -195,7 +266,8 @@ class BagOfWords(Detector):
         clf = LogisticRegression(max_iter=self.cfg.get("max_iter", 2000),
                                  C=self.cfg.get("C", 1.0))
         self.pipe = make_pipeline(vec, clf)
-        X = [self._text(it, condition) for it in items]
+        X = [self._text(it, c)
+             for it, c in zip(items, self._conds(items, conditions))]
         self.pipe.fit(X, y)
         self.fit_meta = {
             "fields": self.cfg.get("fields", "both"),
@@ -248,9 +320,20 @@ class LinearProbe(Detector):
     def _feat(self, item, condition):
         return self.model.acts.get(item, condition, self.layer, self.position)
 
-    def fit(self, items, labels, condition=Condition.CONFLICTING):
+    @staticmethod
+    def _conds(items, conditions):
+        """Per-instance conditions, defaulting to all-C (arbitration)."""
+        if conditions is None:
+            return [Condition.CONFLICTING] * len(items)
+        if len(conditions) != len(items):
+            raise ValueError(
+                f"conditions has length {len(conditions)}, items {len(items)}")
+        return list(conditions)
+
+    def fit(self, items, labels, conditions=None):
         from sklearn.linear_model import LogisticRegression
-        X = np.stack([self._feat(it, condition) for it in items])
+        X = np.stack([self._feat(it, c)
+                      for it, c in zip(items, self._conds(items, conditions))])
         y = np.asarray(labels)
         self.clf = LogisticRegression(max_iter=self.cfg.get("max_iter", 2000),
                                       C=self.cfg.get("C", 1.0))
@@ -298,14 +381,26 @@ class DiffMeanProjection(Detector):
     def _feat(self, item, condition):
         return self.model.acts.get(item, condition, self.layer, self.position)
 
-    def fit(self, items, labels, condition=Condition.CONFLICTING):
-        X = np.stack([self._feat(it, condition) for it in items])
+    @staticmethod
+    def _conds(items, conditions):
+        """Per-instance conditions, defaulting to all-C (arbitration)."""
+        if conditions is None:
+            return [Condition.CONFLICTING] * len(items)
+        if len(conditions) != len(items):
+            raise ValueError(
+                f"conditions has length {len(conditions)}, items {len(items)}")
+        return list(conditions)
+
+    def fit(self, items, labels, conditions=None):
+        X = np.stack([self._feat(it, c)
+                      for it, c in zip(items, self._conds(items, conditions))])
         y = np.asarray(labels)
         if y.sum() == 0 or y.sum() == len(y):
             raise ValueError(
                 f"diffmean_proj: train fold has a single class "
-                f"({int(y.sum())}/{len(y)} context-followers); no contrast to "
-                f"take a difference of")
+                f"({int(y.sum())}/{len(y)} positive); no contrast to take a "
+                f"difference of - check context_following_rate (arbitration) "
+                f"or that both S and C instances reached fit() (conflict)")
         mu_ctx, mu_par = X[y == 1].mean(0), X[y == 0].mean(0)
         w = mu_ctx - mu_par
         self.raw_norm = float(np.linalg.norm(w))
@@ -361,8 +456,8 @@ class LogitLensReadout(Detector):
         h = self.model.acts.get(item, condition, self.layer, self.position)
         z = self.model.unembed(h)
         logp = torch.log_softmax(z, -1)
-        t_id = self.model.first_token_id(" " + item.true_answer)
-        c_id = self.model.first_token_id(" " + item.counterfactual_answer)
+        t_id = self.model.first_token_id(continuation(item.true_answer))
+        c_id = self.model.first_token_id(continuation(item.counterfactual_answer))
         return DetectionRecord(
             item.item_id, item.relation, condition, self.name,
             score=float(logp[c_id] - logp[t_id]),
@@ -429,25 +524,63 @@ class SelfCheckNLIDetector(Detector):
 
 @register_detector("p_true")
 class PTrue(Detector):
-    """Verbalized self-report: ask the model whether the passage's claim is
-    true / whether it will answer from the passage; score = P('Yes').
-    This is the 'prompting baseline' leg of the mandatory triplet."""
+    """Verbalized self-report - the prompting leg of the triplet.
+
+    Under the `conflict` task it asks the benchmark's question in as many
+    words, about the passage the model was actually given:
+
+        "does the passage above contradict what you know about X?"
+
+    and scores P('Yes'), so HIGHER = more conflict with no flip needed.  This
+    is condition-sensitive by construction, which the older arbitration
+    template was not: that one asked about a fixed counterfactual claim
+    regardless of which passage the item was presented with, so it would have
+    returned nearly the same number under S and under C and could not have
+    separated them.
+
+    Under the `arbitration` task the original template is kept verbatim, so
+    the legacy numbers stay reproducible.  There the claim is the
+    counterfactual statement and a HIGH P('Yes') means the model finds the
+    counterfactual plausible, i.e. is more likely to follow the context -
+    the same orientation, so again no flip.
+
+    Note this detector builds its own prompt rather than going through
+    core/prompts.py.  That is a deliberate exception to invariant 7 and it is
+    load-bearing: the question being asked is not the item's question, so the
+    shared stem does not apply.  Worth noticing that on the pilot this was the
+    only detector above 0.55, which is weak evidence that the shared prompt
+    format is costing the methods locked into it.
+    """
     access = "black-box"
 
+    #: the conflict question - about the passage in front of the model
+    TEMPLATE_CONFLICT = (
+        "Background: {passage}\n\nQuestion: does the passage above "
+        "contradict what you know about {subject}?\n"
+        "Answer Yes or No.\nAnswer:")
+    #: the legacy arbitration question - about a fixed counterfactual claim
     TEMPLATE = ("Background: {passage}\n\nQuestion: is the following claim "
                 "consistent with your knowledge: \"{claim}\"?\n"
                 "Answer Yes or No.\nAnswer:")
 
     def score(self, item, condition):
+        passage = item.passages.get(getattr(condition, "value", condition), "")
         claim = item.meta.get("cf_statement") or (
             item.cloze_template.replace("____", item.counterfactual_answer))
-        prompt = self.TEMPLATE.format(
-            passage=item.passages.get(condition.value, ""), claim=claim)
-        lp_yes = self.model.logp_continuation(prompt, " Yes")
-        lp_no = self.model.logp_continuation(prompt, " No")
+        if self.task == "arbitration":
+            prompt = self.TEMPLATE.format(passage=passage, claim=claim)
+        else:
+            prompt = self.TEMPLATE_CONFLICT.format(
+                passage=passage, subject=item.subject or "the subject")
+        # this prompt is built here rather than by PromptSpec, but it must
+        # still reach the model in the run's format or it is not comparable
+        # with the detectors that go through build_prompt
+        prompt = wrap_chat(prompt)
+        lp_yes = self.model.logp_continuation(prompt, continuation("Yes"))
+        lp_no = self.model.logp_continuation(prompt, continuation("No"))
         m = max(lp_yes, lp_no)
         p_yes = float(np.exp(lp_yes - m) / (np.exp(lp_yes - m) + np.exp(lp_no - m)))
         return DetectionRecord(item.item_id, item.relation, condition,
                                self.name, score=p_yes,
                                extras={"logp_yes": lp_yes, "logp_no": lp_no,
-                                       "claim": claim})
+                                       "task": self.task})

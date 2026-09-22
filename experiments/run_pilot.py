@@ -11,9 +11,13 @@ Steps, in order:
     2. data       load, drop first-token collisions, sample `limit` items
                   evenly over relations, label each by the model's generation
     3. conditions N/S/C/R margins for every item (fills the shared margin table)
-    4. detection  every detector, GroupKFold by relation
-    5. steering   every steerer, every target x factor
-    6. table      one row per method -> final_table.csv
+    4. detection  every detector over the S-vs-C instances, GroupKFold by
+                  relation ("does this passage contradict what the model
+                  knows?"); `detection_task: arbitration` runs the legacy axis
+    5. steering   every steerer, every target x factor x condition - C is the
+                  measurement, S the matched specificity control
+    6. table      one row per detector, and one per (steerer, target), with
+                  n_flippable beside every rate -> final_table.csv
 
 What is run is decided by the config (configs/pilot_five.yaml), not here.
 """
@@ -97,11 +101,20 @@ def main(argv=None):
     manifest = {"config": cfg, "model": model.describe(),
                 "prompt": prompts.DEFAULT.as_dict(), "n_items": len(items),
                 "relations": sorted(set(groups)),
+                "detection_task": cfg.get("detection_task", "conflict"),
+                "format_correct": cfg.get("format_correct", False),
                 "context_following_rate": float(np.mean(labels))}
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str),
                                        encoding="utf-8")
     print(f"data: {len(items)} items over {len(set(groups))} relations, "
           f"context-following rate {np.mean(labels):.3f}")
+    # the behavioural rate still gates the TRAINABLE STEERERS (their contrast
+    # is behavioural); the conflict detection axis does not depend on it, so a
+    # degenerate rate no longer takes the whole run down with it
+    print(f"detection task: {cfg.get('detection_task', 'conflict')}  "
+          f"format_correct: {cfg.get('format_correct', False)}  "
+          f"steering conditions: "
+          f"{cfg.get('steering_conditions', [cfg.get('steering_condition', 'C')])}")
 
     # 3-5. methods
     runner.run_conditions(cfg, model, items, labels, out)
