@@ -1,12 +1,10 @@
-"""Single shared model wrapper.
+"""Single shared model wrapper - the `M` every method receives.
 
-Everything every method needs from the model lives here so that mechanistic
-and output-based methods run against the *same* forward passes and prompts:
-  - teacher-forced log-prob of a candidate continuation (v3 semantics)
+  - teacher-forced log-prob of a continuation
   - residual-stream capture at chosen layers/positions
   - additive residual-stream intervention (CAA / DiffMean steering)
-  - free generation and multi-sample generation (for SE / SelfCheckGPT)
-  - logits with and without context (for CAD / CK-PLUG-style decoding)
+  - greedy decoding with an optional per-step logits function, and sampling
+  - a counter of forward passes, which is how the harness reports cost
 
 The model is a config knob, not a constant: `from_config` accepts either
 `model: <hf-id>` or a `model:` block with name/device/dtype/revision/etc.
@@ -61,11 +59,9 @@ def _find_layers(model):
 
 
 class ModelWrapper:
-    def __init__(self, model_name="meta-llama/Llama-3.1-8B-Instruct",
+    def __init__(self, model_name="microsoft/Phi-3.5-mini-instruct",
                  device="auto", dtype="auto", cache_dir=None,
-                 activation_cache_dir=None, margin_table_path=None,
-                 reference_condition="R", format_correct=False,
-                 trust_remote_code=False,
+                 activation_cache_dir=None, trust_remote_code=False,
                  revision=None, load_kwargs=None, tokenizer_name=None):
         from transformers import AutoModelForCausalLM, AutoTokenizer
         self.model_name = model_name
@@ -99,19 +95,29 @@ class ModelWrapper:
         self.n_layers = len(self._layers)
         self.hidden_size = self.model.config.hidden_size
         from conflict_bench.core.activations import ActivationCache
-        from conflict_bench.core.margins import MarginTable
         self.acts = ActivationCache(self, activation_cache_dir)
-        # the N/S/C/R teacher-forced margins, scored once and shared by every
-        # method that wants them (detectors, steerers, the R correction)
-        self.margins = MarginTable(self, margin_table_path,
-                                   reference=reference_condition,
-                                   correct=format_correct)
+        # Every forward pass of the network is counted, whoever asks for it,
+        # so each method's cost is measured by the harness instead of declared.
+        self.forward_passes = 0
+        self.model.register_forward_hook(self._count_forward)
+        self._stop_ids = self._find_stop_ids()
+
+    def _count_forward(self, *_):
+        self.forward_passes += 1
+
+    def _find_stop_ids(self):
+        ids = {self.tok.eos_token_id}
+        vocab = self.tok.get_vocab()
+        for t in ("<|end|>", "<|eot_id|>", "<end_of_turn>", "<|im_end|>",
+                  "<|endoftext|>", "</s>"):
+            if t in vocab:
+                ids.add(vocab[t])
+        return {i for i in ids if i is not None}
 
     @classmethod
-    def from_config(cls, cfg, activation_cache_dir=None,
-                    margin_table_path=None):
+    def from_config(cls, cfg, activation_cache_dir=None):
         """`model:` may be a plain hf id or a block of kwargs."""
-        spec = cfg.get("model", "meta-llama/Llama-3.1-8B-Instruct")
+        spec = cfg.get("model", "microsoft/Phi-3.5-mini-instruct")
         if isinstance(spec, str):
             spec = {"model_name": spec}
         else:
@@ -119,9 +125,6 @@ class ModelWrapper:
             name = spec.pop("name", None) or spec.pop("model_name", None)
             spec["model_name"] = name
         spec.setdefault("activation_cache_dir", activation_cache_dir)
-        spec.setdefault("margin_table_path", margin_table_path)
-        spec.setdefault("reference_condition", cfg.get("reference_condition", "R"))
-        spec.setdefault("format_correct", cfg.get("format_correct", False))
         return cls(**spec)
 
     def describe(self):
@@ -138,12 +141,33 @@ class ModelWrapper:
             return int(round(layer * (self.n_layers - 1)))
         return int(layer) % self.n_layers
 
-    # ---------- teacher-forced scoring (matches v3) ----------
+    # ---------- tokenisation: the one place a prompt becomes ids ----------
+    def _add_specials(self, prompt: str) -> bool:
+        """A chat template may already have written BOS into the text; adding
+        it again gives the model a prompt it was never trained on."""
+        bos = self.tok.bos_token
+        return not (bos and prompt.startswith(bos))
+
+    def encode(self, prompt: str):
+        return self.tok(prompt, return_tensors="pt",
+                        add_special_tokens=self._add_specials(prompt)
+                        ).input_ids.to(self.device)
+
+    def offsets(self, prompt: str):
+        """Character span of every token of `encode(prompt)`."""
+        return self.tok(prompt, return_offsets_mapping=True,
+                        add_special_tokens=self._add_specials(prompt)
+                        )["offset_mapping"]
+
+    def continuation_ids(self, continuation: str):
+        return self.tok(continuation, add_special_tokens=False).input_ids
+
+    # ---------- teacher-forced scoring ----------
     @torch.no_grad()
     def logp_continuation(self, prompt: str, continuation: str,
                           length_normalize: bool = False) -> float:
         """Sum (or mean) log-prob of `continuation` tokens given `prompt`."""
-        p_ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
+        p_ids = self.encode(prompt)
         c_ids = self.tok(continuation, add_special_tokens=False,
                          return_tensors="pt").input_ids.to(self.device)
         ids = torch.cat([p_ids, c_ids], dim=1)
@@ -171,7 +195,7 @@ class ModelWrapper:
         `logp_continuation` exactly, so a decoding method at strength 0 lands
         on the shared MarginTable value by construction.
         """
-        p_ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
+        p_ids = self.encode(prompt)
         c_ids = self.tok(continuation, add_special_tokens=False,
                          return_tensors="pt").input_ids.to(self.device)
         ids = torch.cat([p_ids, c_ids], dim=1)
@@ -201,8 +225,7 @@ class ModelWrapper:
             hooks.append(self._layers[self.resolve_layer(l)]
                          .register_forward_hook(make_hook(l)))
         try:
-            ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
-            self.model(ids)
+            self.model(self.encode(prompt))
         finally:
             for h in hooks:
                 h.remove()
@@ -295,22 +318,59 @@ class ModelWrapper:
 
     # ---------- generation ----------
     @torch.no_grad()
-    def generate(self, prompt: str, max_new_tokens=32, temperature=0.0,
-                 num_samples=1):
-        enc = self.tok(prompt, return_tensors="pt").to(self.device)
-        ids = enc.input_ids
-        do_sample = temperature > 0
-        out = self.model.generate(
-            ids, attention_mask=enc.get("attention_mask"),
-            max_new_tokens=max_new_tokens, do_sample=do_sample,
-            temperature=temperature if do_sample else None,
-            num_return_sequences=num_samples,
-            pad_token_id=self.tok.pad_token_id or self.tok.eos_token_id)
-        return [self.tok.decode(o[ids.shape[1]:], skip_special_tokens=True)
-                for o in out]
-
-    # ---------- contrastive logits (CAD / CK-PLUG family) ----------
-    @torch.no_grad()
-    def next_token_logits(self, prompt: str):
-        ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
+    def next_logits(self, prompt: str, generated=()):
+        """Next-token logits after `prompt` + the token ids in `generated`."""
+        ids = self.encode(prompt)
+        if len(generated):
+            ids = torch.cat([ids, torch.tensor([list(generated)],
+                                               device=self.device)], dim=1)
         return self.model(ids).logits[0, -1].float()
+
+    @torch.no_grad()
+    def greedy(self, prompt: str, max_new_tokens=12, logits_fn=None):
+        """Greedy decoding, one full forward pass per token.
+
+        Written out instead of calling `model.generate` for two reasons: the
+        unsteered answer `d` and every steered answer `x` must come from the
+        same decoding loop (HF `generate` silently applies whatever the
+        model's generation_config ships - repetition penalties and the like),
+        and a decoding-time method plugs in as `logits_fn(z, generated) -> z`.
+        Activation hooks are simply left installed around the call.
+        """
+        out = []
+        for _ in range(max_new_tokens):
+            z = self.next_logits(prompt, out)
+            if logits_fn is not None:
+                z = logits_fn(z, out)
+            t = int(z.argmax())
+            if t in self._stop_ids:
+                break
+            out.append(t)
+        return self.tok.decode(out, skip_special_tokens=True).strip()
+
+    @torch.no_grad()
+    def logp_steered(self, prompt: str, continuation: str, logits_fn=None):
+        """Teacher-forced log-prob of `continuation` under the same loop as
+        `greedy` (so hooks and `logits_fn` apply to it identically)."""
+        ids = self.continuation_ids(continuation)
+        total = 0.0
+        for t in range(len(ids)):
+            z = self.next_logits(prompt, ids[:t])
+            if logits_fn is not None:
+                z = logits_fn(z, ids[:t])
+            total += float(torch.log_softmax(z, -1)[ids[t]])
+        return total
+
+    @torch.no_grad()
+    def sample(self, prompt: str, num_samples=10, max_new_tokens=12,
+               temperature=1.0):
+        """`num_samples` sampled answers (for answer entropy)."""
+        ids = self.encode(prompt)
+        out = self.model.generate(
+            ids, attention_mask=torch.ones_like(ids),
+            max_new_tokens=max_new_tokens, do_sample=True,
+            temperature=temperature, top_p=1.0, top_k=0,
+            repetition_penalty=1.0, num_return_sequences=num_samples,
+            pad_token_id=self.tok.pad_token_id or self.tok.eos_token_id)
+        return [self.tok.decode(o[ids.shape[1]:], skip_special_tokens=True).strip()
+                for o in out]

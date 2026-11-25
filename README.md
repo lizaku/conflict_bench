@@ -1,56 +1,122 @@
 # conflict_bench
 
-A research harness for studying how a language model arbitrates between what a
-prompt tells it and what it already knows. Each item pairs a question with a
-passage that has been rewritten to assert a counterfactual answer, and is
-scored under four conditions — no passage, a supporting passage, the
-conflicting passage, and an irrelevant one that serves as a format baseline.
-The dependent variable throughout is the teacher-forced log-probability margin
-between the true and counterfactual answers.
+A benchmark for **knowledge conflicts between a model's memory and its
+context**: detecting them, and steering which source the model follows.
 
-On top of that design the harness runs two axes, in the shape of AxBench.
+A conflict is defined relative to the model `M`. Three conditions must hold:
 
-**Detection** asks *"does this passage contradict what the model already
-knows?"* Each item is scored twice — once with its supporting passage, once
-with its conflicting one — and the label is which of the two it was. Linear
-probes and mean-difference directions are compared against prompting,
-sampling and decoding-based signals, with a TF-IDF text baseline, a relation
-base-rate control and a logit-lens readout control reported beside every
-score. Because every item contributes one instance of each class, the base
-rate is 0.5 by construction and the design is paired, so the per-item
-answer-string constant cancels exactly.
+1. `a = M(q)` is stable and confident — the model knows the fact;
+2. the context `c` asserts an answer `b` to `q`;
+3. `a` and `b` cannot both be true.
 
-**Steering** asks *"given a conflicting passage, can the intervention make the
-model output the conflicting answer when it otherwise would not?"* Activation
-addition (CAA) is compared against contrastive decoding methods (CAD, AdaCAD,
-CK-PLUG) and an explicit prompt instruction, on a shared margin DV. Each
-method runs under both the conflicting and the supporting passage: the
-supporting arm is a matched specificity control on the same item, so an
-effect that survives the subtraction is resolving a conflict rather than
-amplifying whatever the passage said. Both targets — push toward the context,
-push toward memory — are always reported as their own rows, each with the
-number of items that could actually move.
+So the benchmark is not a fixed dataset. It is a pipeline that is run once per
+model: find out what `M` knows, then build contexts by controlled edits so
+that every one lands in a known cell of the taxonomy (supports · contradicts ·
+novel · irrelevant; 1 or 2 facts on the answer path; one or two passages;
+cloze or short answer). No ground truth about the world is used.
 
-Both axes fit under GroupKFold by relation, so nothing is scored on a relation
-it was fitted on.
+Three parts, with a fixed contract between them:
 
-Prompts are built in one place (`core/prompts.py`) and, when the tokenizer has
-a chat template, wrapped in it — an instruction-tuned model is addressed the
-way it was tuned rather than in raw-completion mode. A steering instruction is
-placed ahead of the passage. Both are config switches (`prompt.chat`,
-`prompt.instruction_position`) rather than code.
+| Part | Code | Who |
+|---|---|---|
+| **Construction** — builds every instance for a model | `construct/` | benchmark |
+| **Methods** — detectors and steerers, one file per family | `methods/` | students |
+| **Evaluation** — runs methods, scores predictions | `harness.py`, `evaluate.py` | benchmark |
 
-## Data
+A method receives the question, the context sentences and the model. It never
+receives a label or an answer. A detector returns a score; a steerer returns
+an *intervention* and the harness generates the answer.
 
-The ConFiQA-derived corpus this runs on is **not included** in the repository.
-`data.load_confiqa_cloze_clusters` expects one JSON file per Wikidata relation
-under `data/ConfiQA_cloze_clustered/`; point `dataset.kwargs.data_dir` at your
-own copy.
+`PLAN.md` has the design and a worked example (Marie Curie) for every row of
+the taxonomy. `DECISIONS.md` records every choice made while implementing it.
+`CLAUDE.md` is the working notes on the code.
 
 ## Run
 
+Run from the **parent** of this folder (the code imports itself as
+`conflict_bench.*`).
+
 ```bash
 pip install torch transformers scikit-learn pandas numpy pyyaml
-python -m conflict_bench.run --config conflict_bench/configs/default.yaml
-python -m conflict_bench.experiments.run_pilot --limit 200
+
+# 1. build the benchmark for a model  ->  conflict_bench/bench/<model>/
+python -m conflict_bench.construct.build --model microsoft/Phi-3.5-mini-instruct
+
+# 2. run the methods on ~100 instances and evaluate
+python -m conflict_bench.harness --model microsoft/Phi-3.5-mini-instruct --limit 100
 ```
+
+Sizes:
+
+| Command | What it does |
+|---|---|
+| `build` | all 6000 seed facts |
+| `build --limit 300` | a pilot: 300 seed facts spread over the relations |
+| `build --measure-limit 500` | build all contexts, run the model on about 500 of them |
+| `build --steps contexts,export` | rebuild contexts after editing a recipe (no GPU) |
+| `harness --limit 100` | about 100 instances of the four core recipes |
+| `harness --limit 1000 --recipes all` | every recipe that was built |
+| `harness --detectors bow,p_true --steerers none` | a subset of methods |
+
+Both GPU steps of the build append as they go; re-running the same command
+resumes.
+
+## What is in `bench/<model>/`
+
+| File | Content |
+|---|---|
+| `beliefs.jsonl` | per seed fact: the answers M gave, its state (known / uncertain / unknown), entropy, probability of `a` |
+| `instances.jsonl` | the benchmark: sentences with their labels, answers, targets, and M's own behaviour (`d`, confidence with context) |
+| `public.jsonl` | what a method sees: question, sentences, format |
+| `card.md` | the funnel, the rejections, and 3 examples per recipe to read by hand |
+| `rejected.jsonl` | every fact that produced no instance, with the reason |
+| `runs/<name>/` | predictions, `detection.csv`, `localization.csv`, `steering.csv`, `report.md` |
+
+`bench/` is gitignored. Share the folder, or rebuild it.
+
+## Adding a method
+
+```python
+# methods/components.py
+from conflict_bench.api import Detection, Detector, Intervention, Steerer, \
+    register_detector, register_steerer
+
+@register_detector("my_detector")
+class MyDetector(Detector):
+    access = "activations"                  # "text" | "logits" | "activations"
+    def score(self, inst):                  # inst.question, inst.chunks, inst.prompt
+        return Detection(conflict=0.7, chunks=[0.1, 0.9, 0.0, 0.1])
+
+@register_steerer("my_steerer")
+class MySteerer(Steerer):
+    strengths = [1.0, 2.0]
+    def intervene(self, inst, direction, strength, span=None):   # "ctx" | "mem" | "span"
+        return Intervention(hooks=lambda: self.model.add_direction(...))
+```
+
+Import the file in `methods/__init__.py` and list the names under `detectors:`
+/ `steerers:` in `configs/default.yaml`. A method that needs training defines
+`fit(train)` and sets `requires_training = True`; it is then fitted on the
+training folds only (folds are whole relations).
+
+## Test without a GPU
+
+```bash
+python -m conflict_bench.tests.smoke
+```
+
+A tiny randomly-initialised model through every step, plus a check of the
+construction's invariants on the whole seed. Needs one cached tokenizer with a
+chat template (`--tokenizer`).
+
+## Data
+
+The ConFiQA-derived seed is **not included**. The build expects one JSON file
+per Wikidata relation under `data/ConfiQA_cloze_clustered/` (`seed_data` in
+the config).
+
+## History
+
+`git checkout milestone-1-nscr-pilot` is the previous benchmark: fixed ConfiQA
+items scored under four passage conditions (N/S/C/R), with margin-flip
+steering.

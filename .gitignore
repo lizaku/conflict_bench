@@ -5,7 +5,12 @@ __pycache__/
 .venv/
 venv/
 
-# Run outputs (activations, margin tables, fitted vectors, summaries)
+# The built benchmark: bench/<model>/ holds every instance for one model,
+# its caches and its run results. Share the folder directly, or rebuild it
+# with `python -m conflict_bench.construct.build`.
+bench/
+
+# Old run outputs
 runs/
 *.npz
 *.pt

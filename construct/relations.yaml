@@ -1,0 +1,124 @@
+# Per-relation metadata the seed does not carry. Hand-written, 40 rows.
+#
+# single_valued  true  -> a different value is a contradiction (condition 3:
+#                         "a and b cannot both be true"), so the relation can
+#                         carry `con` instances by entity swap.
+#                false -> a swap is not a guaranteed contradiction (a person
+#                         has several awards, a film several genres). Facts of
+#                         these relations are used as fillers and as hop 1 of
+#                         2-hop questions only. When in doubt: false.
+# person         the subject is a person (selects the invented-bridge template)
+# np             noun phrase that stands for the answer, used to turn the fact
+#                into hop 1 of a 2-hop question; omit to never use it as hop 1
+# paraphrases    two more ways to ask the question, for the stability check
+#
+# {s} is the subject.
+
+P101:  {label: field of work, single_valued: false, person: true,
+        np: "the field of work of {s}",
+        paraphrases: ["In which field does {s} work?", "What is {s}'s field of work?"]}
+P103:  {label: native language, single_valued: true, person: true,
+        np: "the native language of {s}",
+        paraphrases: ["Which language is {s}'s mother tongue?", "What language did {s} grow up speaking?"]}
+P108:  {label: employer, single_valued: false, person: true,
+        np: "the employer of {s}",
+        paraphrases: ["Who is the employer of {s}?", "Which organization does {s} work for?"]}
+P112:  {label: founded by, single_valued: false,
+        np: "the founder of {s}",
+        paraphrases: ["Who founded {s}?", "Who is the founder of {s}?"]}
+P127:  {label: owned by, single_valued: false,
+        np: "the owner of {s}",
+        paraphrases: ["Who owns {s}?", "Who is the owner of {s}?"]}
+P136:  {label: genre, single_valued: false,
+        paraphrases: ["What genre is {s} associated with?", "Which genre does {s} belong to?"]}
+P1376: {label: capital of, single_valued: false,
+        paraphrases: ["What is {s} the capital of?", "{s} is the capital of which place?"]}
+P140:  {label: religion, single_valued: true, person: true,
+        np: "the religion of {s}",
+        paraphrases: ["What is the religion of {s}?", "Which religion does {s} follow?"]}
+P155:  {label: follows, single_valued: true,
+        np: "the predecessor of {s}",
+        paraphrases: ["What does {s} follow?", "Which work comes immediately before {s}?"]}
+P159:  {label: headquarters location, single_valued: false,
+        np: "the place where {s} is headquartered",
+        paraphrases: ["Where is {s} headquartered?", "In which city is the headquarters of {s}?"]}
+P166:  {label: award received, single_valued: false, person: true,
+        paraphrases: ["Which award did {s} receive?", "What award was given to {s}?"]}
+P169:  {label: chief executive officer, single_valued: true,
+        np: "the chief executive officer of {s}",
+        paraphrases: ["Who is the CEO of {s}?", "Who is the chief executive officer of {s}?"]}
+P17:   {label: country, single_valued: true,
+        np: "the country of {s}",
+        paraphrases: ["In which country is {s}?", "Which country is {s} located in?"]}
+P170:  {label: creator, single_valued: false,
+        np: "the creator of {s}",
+        paraphrases: ["Who created {s}?", "Who is the creator of {s}?"]}
+P172:  {label: ethnic group, single_valued: false, person: true,
+        paraphrases: ["What is the ethnic group of {s}?", "Which ethnic group does {s} belong to?"]}
+P175:  {label: performer, single_valued: false,
+        np: "the performer of {s}",
+        paraphrases: ["Who performed {s}?", "Who is the performer of {s}?"]}
+P178:  {label: developer, single_valued: false,
+        np: "the developer of {s}",
+        paraphrases: ["Who developed {s}?", "Who is the developer of {s}?"]}
+P26:   {label: spouse, single_valued: true, person: true,
+        np: "the spouse of {s}",
+        paraphrases: ["Who is the spouse of {s}?", "Who is {s} married to?"]}
+P264:  {label: record label, single_valued: false,
+        paraphrases: ["Which record label is {s} signed to?", "What is the record label of {s}?"]}
+P27:   {label: country of citizenship, single_valued: false, person: true,
+        np: "the country of citizenship of {s}",
+        paraphrases: ["Which country is {s} a citizen of?", "What is the country of citizenship of {s}?"]}
+P276:  {label: location, single_valued: false,
+        paraphrases: ["Where is {s} located?", "In which place is {s}?"]}
+P286:  {label: head coach, single_valued: true,
+        np: "the head coach of {s}",
+        paraphrases: ["Who is the head coach of {s}?", "Who coaches {s}?"]}
+P30:   {label: continent, single_valued: true,
+        np: "the continent of {s}",
+        paraphrases: ["On which continent is {s}?", "Which continent is {s} part of?"]}
+P35:   {label: head of state, single_valued: true,
+        np: "the head of state of {s}",
+        paraphrases: ["Who is the head of state of {s}?", "Who serves as head of state of {s}?"]}
+P36:   {label: capital, single_valued: true,
+        np: "the capital of {s}",
+        paraphrases: ["What is the capital of {s}?", "Which city is the capital of {s}?"]}
+P37:   {label: official language, single_valued: false,
+        paraphrases: ["What is the official language of {s}?", "Which language is official in {s}?"]}
+P38:   {label: currency, single_valued: true,
+        np: "the currency of {s}",
+        paraphrases: ["What is the currency of {s}?", "Which currency is used in {s}?"]}
+P39:   {label: position held, single_valued: false, person: true,
+        paraphrases: ["What position does {s} hold?", "Which position is held by {s}?"]}
+P407:  {label: language of work or name, single_valued: true,
+        paraphrases: ["In which language is {s}?", "What is the language of {s}?"]}
+P413:  {label: position played, single_valued: false, person: true,
+        paraphrases: ["Which position does {s} play?", "What position does {s} play on the field?"]}
+P463:  {label: member of, single_valued: false,
+        paraphrases: ["Which group is {s} a member of?", "What is {s} a member of?"]}
+P488:  {label: chairperson, single_valued: true,
+        np: "the chairperson of {s}",
+        paraphrases: ["Who is the chairperson of {s}?", "Who chairs {s}?"]}
+P495:  {label: country of origin, single_valued: true,
+        np: "the country of origin of {s}",
+        paraphrases: ["Which country does {s} come from?", "What is the country of origin of {s}?"]}
+P50:   {label: author, single_valued: true,
+        np: "the author of {s}",
+        paraphrases: ["Who wrote {s}?", "Who is the author of {s}?"]}
+P54:   {label: member of sports team, single_valued: false, person: true,
+        np: "the sports team of {s}",
+        paraphrases: ["Which team does {s} play for?", "What sports team is {s} a member of?"]}
+P57:   {label: director, single_valued: false,
+        np: "the director of {s}",
+        paraphrases: ["Who directed {s}?", "Who is the director of {s}?"]}
+P6:    {label: head of government, single_valued: true,
+        np: "the head of government of {s}",
+        paraphrases: ["Who is the head of government of {s}?", "Who leads the government of {s}?"]}
+P641:  {label: sport, single_valued: true,
+        paraphrases: ["Which sport is {s} associated with?", "What sport does {s} play?"]}
+P86:   {label: composer, single_valued: false,
+        np: "the composer of {s}",
+        paraphrases: ["Who composed the music for {s}?", "Who is the composer of {s}?"]}
+P937:  {label: work location, single_valued: false, person: true,
+        np: "the work location of {s}",
+        paraphrases: ["Where does {s} work?", "In which place does {s} work?"]}
